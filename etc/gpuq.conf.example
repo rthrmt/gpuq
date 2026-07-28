@@ -1,0 +1,15 @@
+[daemon]
+socket_path = /run/gpuq/gpuq.sock
+db_path = /var/lib/gpuq/queue.db
+log_path = /var/log/gpuq/daemon.log
+poll_interval_seconds = 5
+# socket_mode = 0666       ; default 0666: open to all local users (no group needed).
+                           ; To restrict access, set a tighter mode (e.g. 0660) and
+                           ; manage socket ownership/group yourself.
+
+[gpus]
+# managed_gpus = 0,1,2,3   ; default: all GPUs detected by nvidia-smi
+idle_memory_threshold_mb = 500
+
+[fairness]
+max_gpus_per_user = 0      ; 0 = unlimited

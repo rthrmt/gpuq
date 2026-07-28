@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpuq"
+version = "0.1.0"
+description = "Lightweight single-node GPU job scheduler for multi-user Linux servers"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+# Runtime is stdlib-only by design. No runtime dependencies.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+gpuq = "gpuq.cli:main"
+gpuqd = "gpuq.daemon:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

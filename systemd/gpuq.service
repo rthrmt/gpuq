@@ -1,0 +1,20 @@
+[Unit]
+Description=GPU Job Queue Daemon (gpuq)
+After=network.target
+
+[Service]
+Type=simple
+# Note: gpuqd is installed by pip as an entrypoint. The path below is the typical
+# location, but it may be installed elsewhere depending on the pip prefix (e.g.,
+# /usr/bin/gpuqd, ~/.local/bin/gpuqd). The installer will patch ExecStart if needed.
+ExecStart=/usr/local/bin/gpuqd
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=gpuq
+# World-traversable so the 0666 socket inside it is reachable by all local users.
+RuntimeDirectoryMode=0755
+StandardOutput=append:/var/log/gpuq/daemon.log
+StandardError=append:/var/log/gpuq/daemon.log
+
+[Install]
+WantedBy=multi-user.target

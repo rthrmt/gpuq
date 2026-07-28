@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Fake nvidia-smi shim for testing gpuq.
+
+Reads GPU state from the file pointed to by the GPUQ_FAKE_GPUS environment
+variable and writes it verbatim to stdout, then exits 0.
+
+If GPUQ_FAKE_GPUS is unset, prints a single default GPU line.
+If GPUQ_FAKE_GPUS is set but the file does not exist, prints an error to
+stderr and exits 1 (exercises the failure path in query_gpus).
+
+The state file must contain lines in the exact format nvidia-smi produces
+for --format=csv,noheader,nounits:
+    index, used_MiB, total_MiB, free_MiB
+"""
+
+import os
+import sys
+
+state_file = os.environ.get("GPUQ_FAKE_GPUS")
+
+if state_file is None:
+    # No file configured — emit a single default GPU line.
+    print("0, 0, 24576, 24576")
+    sys.exit(0)
+
+if not os.path.exists(state_file):
+    print(f"fake nvidia-smi: state file not found: {state_file}", file=sys.stderr)
+    sys.exit(1)
+
+with open(state_file) as fh:
+    sys.stdout.write(fh.read())
+sys.exit(0)
