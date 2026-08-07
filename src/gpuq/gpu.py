@@ -35,11 +35,19 @@ class NvidiaSmiError(Exception):
 
 
 @dataclass(frozen=True)
+class GpuProcess:
+    pid: int
+    process_name: str
+    used_memory: int  # bytes
+
+
+@dataclass(frozen=True)
 class GpuInfo:
     index: int      # physical GPU index
     mem_total: int  # bytes
     mem_used: int   # bytes
     mem_free: int   # bytes
+    utilization_pct: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -81,11 +89,12 @@ def parse_csv(
 
     Each non-empty line must be in the form::
 
-        index, used_MiB, total_MiB, free_MiB
+        index, used_MiB, total_MiB, free_MiB, utilization_pct
 
     Memory values reported by nvidia-smi are in **MiB**; they are converted to
     bytes (MiB * 1 048 576) before being stored in the returned
-    :class:`GpuInfo` objects.
+    :class:`GpuInfo` objects. ``utilization_pct`` is nvidia-smi's
+    ``utilization.gpu`` percentage, already unitless.
 
     Parameters
     ----------
@@ -106,11 +115,11 @@ def parse_csv(
             continue
 
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 4:
+        if len(parts) != 5:
             logger.warning("Skipping malformed nvidia-smi line: %r", line)
             continue
 
-        raw_index, raw_used, raw_total, raw_free = parts
+        raw_index, raw_used, raw_total, raw_free, raw_util = parts
 
         # Skip the whole line if the index is N/A
         if raw_index in ("[N/A]", "N/A"):
@@ -125,11 +134,45 @@ def parse_csv(
         mem_used = _parse_field(raw_used, "memory.used", str(index)) * _MIB
         mem_total = _parse_field(raw_total, "memory.total", str(index)) * _MIB
         mem_free = _parse_field(raw_free, "memory.free", str(index)) * _MIB
+        utilization_pct = _parse_field(raw_util, "utilization.gpu", str(index))
 
-        gpus.append(GpuInfo(index=index, mem_total=mem_total, mem_used=mem_used, mem_free=mem_free))
+        gpus.append(GpuInfo(index=index, mem_total=mem_total, mem_used=mem_used,
+                             mem_free=mem_free, utilization_pct=utilization_pct))
 
     gpus.sort(key=lambda g: g.index)
     return gpus
+
+
+def parse_compute_apps_csv(text: str) -> List[GpuProcess]:
+    """Parse the CSV output of
+    ``nvidia-smi --query-compute-apps=pid,process_name,used_memory
+    --format=csv,noheader,nounits`` for a single GPU (scoped via ``--id=``).
+
+    Each non-empty line is ``pid, process_name, used_memory_MiB``. An empty
+    ``text`` (no compute processes on the GPU) yields an empty list — that is
+    the common case, not an error.
+    """
+    processes: List[GpuProcess] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3:
+            logger.warning("Skipping malformed nvidia-smi compute-apps line: %r", line)
+            continue
+
+        raw_pid, process_name, raw_used = parts
+        if raw_pid in ("[N/A]", "N/A"):
+            logger.warning("Skipping compute-apps line with N/A pid: %r", line)
+            continue
+
+        pid = int(raw_pid)
+        used_memory = _parse_field(raw_used, "used_memory", str(pid)) * _MIB
+        processes.append(GpuProcess(pid=pid, process_name=process_name, used_memory=used_memory))
+
+    return processes
 
 
 def query_gpus(
@@ -154,7 +197,7 @@ def query_gpus(
     binary = nvidia_smi_path()
     cmd = [
         binary,
-        "--query-gpu=index,memory.used,memory.total,memory.free",
+        "--query-gpu=index,memory.used,memory.total,memory.free,utilization.gpu",
         "--format=csv,noheader,nounits",
     ]
 
@@ -183,3 +226,51 @@ def query_gpus(
         raise NvidiaSmiError(msg)
 
     return parse_csv(result.stdout, managed)
+
+
+def query_gpu_processes(index: int, *, timeout: float = 10.0) -> List[GpuProcess]:
+    """Query the compute processes running on a single GPU.
+
+    Scoped to one GPU via ``--id=<index>``, since
+    ``--query-compute-apps`` has no per-row GPU index column of its own.
+    Returns an empty list (not an error) when nvidia-smi reports no compute
+    processes on the GPU.
+
+    Raises
+    ------
+    NvidiaSmiError
+        When the binary is not found, exits non-zero, or times out.
+    """
+    binary = nvidia_smi_path()
+    cmd = [
+        binary,
+        f"--id={index}",
+        "--query-compute-apps=pid,process_name,used_memory",
+        "--format=csv,noheader,nounits",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        msg = f"nvidia-smi binary not found at {binary!r}"
+        logger.error(msg)
+        raise NvidiaSmiError(msg) from None
+    except subprocess.TimeoutExpired:
+        msg = f"nvidia-smi timed out after {timeout}s"
+        logger.error(msg)
+        raise NvidiaSmiError(msg) from None
+
+    if result.returncode != 0:
+        msg = (
+            f"nvidia-smi exited with code {result.returncode}: "
+            f"{result.stderr.strip()!r}"
+        )
+        logger.error(msg)
+        raise NvidiaSmiError(msg)
+
+    return parse_compute_apps_csv(result.stdout)

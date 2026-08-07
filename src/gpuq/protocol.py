@@ -20,6 +20,8 @@ cancel        client  -> daemon   cancel one queued or running job
 terminate     daemon  -> waiter   kill the running command's process group
 cancel_all    client  -> daemon   cancel all of a user's queued jobs
 cancel_response / cancel_all_response  daemon -> client
+audit         client  -> daemon   request placement events for one job
+audit_response daemon -> client   the placement event(s) for that job
 """
 
 import json
@@ -43,6 +45,8 @@ CANCEL_RESPONSE = "cancel_response"
 TERMINATE = "terminate"
 CANCEL_ALL = "cancel_all"
 CANCEL_ALL_RESPONSE = "cancel_all_response"
+AUDIT = "audit"
+AUDIT_RESPONSE = "audit_response"
 
 
 # --- framing --------------------------------------------------------------
@@ -191,3 +195,11 @@ def cancel_all(requesting_user: str) -> Dict[str, Any]:
 
 def cancel_all_response(cancelled: int) -> Dict[str, Any]:
     return {"type": CANCEL_ALL_RESPONSE, "cancelled": cancelled}
+
+
+def audit(job_id: str) -> Dict[str, Any]:
+    return {"type": AUDIT, "job_id": job_id}
+
+
+def audit_response(events) -> Dict[str, Any]:
+    return {"type": AUDIT_RESPONSE, "events": list(events)}

@@ -92,3 +92,76 @@ def test_find_by_prefix(db):
     _add(db, "abcd1234")
     matches = db.find_by_prefix("abcd")
     assert len(matches) == 1 and matches[0].job_id == "abcd1234"
+
+
+# --- placement_events -------------------------------------------------------
+
+_SNAPSHOT = [
+    {"index": 0, "mem_used": 512 * 1024 * 1024, "mem_free": 24 * 1024 ** 3,
+     "mem_total": 24 * 1024 ** 3, "utilization_pct": 5,
+     "processes": [{"pid": 1234, "process_name": "python", "used_memory": 512 * 1024 * 1024}]},
+    {"index": 1, "mem_used": 0, "mem_free": 46 * 1024 ** 3,
+     "mem_total": 46 * 1024 ** 3, "utilization_pct": 0, "processes": []},
+]
+
+
+def _add_placement_event(db, job_id, **kw):
+    db.insert_placement_event(
+        job_id=job_id, user=kw.get("user", "alice"), cmd=kw.get("cmd", "echo hi"),
+        gpus_requested=kw.get("gpus", 1), mem_requested=kw.get("mem"),
+        shareable=kw.get("share", False), gpu_ids=kw.get("gpu_ids", [1]),
+        placed_at=kw.get("ts", "2026-01-01T00:01:00Z"),
+        gpu_snapshot=kw.get("snapshot", _SNAPSHOT),
+    )
+
+
+def test_insert_placement_event_and_query_by_job(db):
+    _add(db, "j1")
+    _add_placement_event(db, "j1", gpu_ids=[1], mem=24 * 1024 ** 3)
+    events = db.placement_events_for_job("j1")
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.job_id == "j1"
+    assert ev.user == "alice"
+    assert ev.cmd == "echo hi"
+    assert ev.gpu_ids == [1]
+    assert ev.mem_requested == 24 * 1024 ** 3
+    assert ev.placed_at == "2026-01-01T00:01:00Z"
+
+
+def test_placement_events_store_full_gpu_snapshot_json(db):
+    """The snapshot round-trips through JSON, including the non-chosen GPU's
+    state and nested process list -- this is the data that would have made
+    the incident (job placed on a GPU another process was already using)
+    diagnosable after the fact."""
+    _add(db, "j1")
+    _add_placement_event(db, "j1", gpu_ids=[1])
+    ev = db.placement_events_for_job("j1")[0]
+    assert ev.gpu_snapshot == _SNAPSHOT
+    # GPU 0 (not chosen) still shows the pre-existing process.
+    gpu0 = next(g for g in ev.gpu_snapshot if g["index"] == 0)
+    assert gpu0["mem_used"] == 512 * 1024 * 1024
+    assert gpu0["processes"][0]["pid"] == 1234
+
+
+def test_placement_events_for_job_empty_when_none_recorded(db):
+    _add(db, "j1")
+    assert db.placement_events_for_job("j1") == []
+
+
+def test_placement_events_for_job_only_matching_job(db):
+    _add(db, "j1")
+    _add(db, "j2")
+    _add_placement_event(db, "j1")
+    _add_placement_event(db, "j2")
+    events = db.placement_events_for_job("j1")
+    assert len(events) == 1
+    assert events[0].job_id == "j1"
+
+
+def test_placement_events_ordered_by_insertion(db):
+    _add(db, "j1")
+    _add_placement_event(db, "j1", ts="2026-01-01T00:01:00Z", gpu_ids=[0])
+    _add_placement_event(db, "j1", ts="2026-01-01T00:02:00Z", gpu_ids=[1])
+    events = db.placement_events_for_job("j1")
+    assert [e.gpu_ids for e in events] == [[0], [1]]

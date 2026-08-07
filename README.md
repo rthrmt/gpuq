@@ -277,6 +277,19 @@ ID      STATUS    GPU  SUBMITTED         STARTED           FINISHED          EXI
 8c9e    failed    0    2026-05-16 11:00  2026-05-16 11:02  2026-05-16 11:04  1     python_eval_py
 ```
 
+### `audit` — GPU state at the moment a job was placed
+
+```bash
+gpuq audit 7a3f
+```
+
+Prints the command, chosen GPU(s), and a full snapshot (memory used/free/total,
+utilization %, and running processes) of **every** managed GPU as of the exact
+moment the scheduler placed the job — not just the GPU(s) it landed on. Useful
+for answering "why did my job land on GPU 2 when GPU 4 was idle?" after the
+fact, since the daemon records this once per placement (see
+`placement_events` in the database).
+
 ---
 
 ## Scheduling Explained

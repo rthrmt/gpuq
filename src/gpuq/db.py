@@ -43,6 +43,21 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_status    ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_user      ON jobs(user);
 CREATE INDEX IF NOT EXISTS idx_submitted ON jobs(submitted_at);
+
+CREATE TABLE IF NOT EXISTS placement_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id         TEXT NOT NULL,
+    user           TEXT NOT NULL,
+    cmd            TEXT NOT NULL,
+    gpus_requested INTEGER NOT NULL,
+    mem_requested  INTEGER,
+    shareable      INTEGER NOT NULL DEFAULT 0,
+    gpu_ids        TEXT NOT NULL,
+    placed_at      TEXT NOT NULL,
+    gpu_snapshot   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_placement_job  ON placement_events(job_id);
+CREATE INDEX IF NOT EXISTS idx_placement_time ON placement_events(placed_at);
 """
 
 
@@ -81,6 +96,36 @@ class Job:
             started_at=row["started_at"],
             finished_at=row["finished_at"],
             exit_code=row["exit_code"],
+        )
+
+
+@dataclass
+class PlacementEvent:
+    id: int
+    job_id: str
+    user: str
+    cmd: str
+    gpus_requested: int
+    mem_requested: Optional[int]
+    shareable: bool
+    gpu_ids: List[int]
+    placed_at: str
+    gpu_snapshot: list   # list of per-GPU dicts (index, mem_used, mem_free,
+                         # mem_total, utilization_pct, processes)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "PlacementEvent":
+        return cls(
+            id=row["id"],
+            job_id=row["job_id"],
+            user=row["user"],
+            cmd=row["cmd"],
+            gpus_requested=row["gpus_requested"],
+            mem_requested=row["mem_requested"],
+            shareable=bool(row["shareable"]),
+            gpu_ids=json.loads(row["gpu_ids"]),
+            placed_at=row["placed_at"],
+            gpu_snapshot=json.loads(row["gpu_snapshot"]),
         )
 
 
@@ -134,6 +179,30 @@ class Database:
             self._conn.execute(
                 "UPDATE jobs SET status=?, gpu_ids=?, started_at=? WHERE job_id=?",
                 (RUNNING, json.dumps(gpu_ids), started_at, job_id),
+            )
+            self._conn.commit()
+
+    def insert_placement_event(
+        self,
+        *,
+        job_id: str,
+        user: str,
+        cmd: str,
+        gpus_requested: int,
+        mem_requested: Optional[int],
+        shareable: bool,
+        gpu_ids: List[int],
+        placed_at: str,
+        gpu_snapshot: list,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO placement_events (job_id, user, cmd, gpus_requested,
+                       mem_requested, shareable, gpu_ids, placed_at, gpu_snapshot)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, user, cmd, gpus_requested, mem_requested,
+                 1 if shareable else 0, json.dumps(gpu_ids), placed_at,
+                 json.dumps(gpu_snapshot)),
             )
             self._conn.commit()
 
@@ -240,3 +309,11 @@ class Database:
         with self._lock:
             rows = self._conn.execute(q, params).fetchall()
         return [Job.from_row(r) for r in rows]
+
+    def placement_events_for_job(self, job_id: str) -> List[PlacementEvent]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM placement_events WHERE job_id=? ORDER BY id",
+                (job_id,),
+            ).fetchall()
+        return [PlacementEvent.from_row(r) for r in rows]

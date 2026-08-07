@@ -31,7 +31,7 @@ from typing import Dict, List, Optional
 from . import errors, protocol
 from .config import Config, load_config
 from .db import Database, Job
-from .gpu import NvidiaSmiError, query_gpus
+from .gpu import NvidiaSmiError, query_gpu_processes, query_gpus
 from .gpustate import GpuState
 from .scheduler import SchedJob, schedule_pass
 
@@ -85,6 +85,37 @@ class Daemon:
         except NvidiaSmiError as exc:
             logger.error("nvidia-smi unavailable at startup: %s", exc)
             return []
+
+    def _gpu_memory_snapshot(self) -> list:
+        """Cheap, non-blocking per-GPU memory/utilization snapshot from the
+        most recent reconcile(). Safe to call while holding _state_lock."""
+        return [
+            {"index": g.index, "mem_used": g.mem_used, "mem_free": g.mem_free,
+             "mem_total": g.mem_total, "utilization_pct": g.utilization_pct}
+            for g in self.state.snapshot()
+        ]
+
+    def _record_placement_event(self, event: dict) -> None:
+        """Finish building and persist a placement_events row: fetch each
+        managed GPU's process list (one nvidia-smi subprocess call per GPU)
+        and write the row. Must be called *without* holding _state_lock --
+        querying processes can block on subprocess I/O for up to the
+        nvidia-smi timeout, and CLAUDE.md's concurrency contract forbids
+        holding the lock across blocking operations."""
+        snapshot = event.pop("gpu_snapshot")
+        for gpu in snapshot:
+            try:
+                procs = query_gpu_processes(gpu["index"])
+            except NvidiaSmiError as exc:
+                logger.warning(
+                    "could not query processes for GPU %d: %s", gpu["index"], exc)
+                procs = []
+            gpu["processes"] = [
+                {"pid": p.pid, "process_name": p.process_name,
+                 "used_memory": p.used_memory}
+                for p in procs
+            ]
+        self.db.insert_placement_event(gpu_snapshot=snapshot, **event)
 
     def _refresh_live(self) -> None:
         """Refresh GpuState from nvidia-smi. Caller holds _state_lock."""
@@ -199,6 +230,9 @@ class Daemon:
                 conn.close()
             elif mtype == protocol.HISTORY:
                 self._reply_history(conn, msg)
+                conn.close()
+            elif mtype == protocol.AUDIT:
+                self._reply_audit(conn, msg)
                 conn.close()
             elif mtype == protocol.CANCEL:
                 self._reply_cancel(conn, msg)
@@ -356,10 +390,27 @@ class Daemon:
                 self._wake.wait(timeout=self.config.poll_interval_seconds)
                 if self._stop.is_set():
                     break
-                self._run_schedule_pass_locked()
+                placement_events = self._run_schedule_pass_locked()
+            # Process-list queries + the DB insert happen outside the lock
+            # (blocking nvidia-smi subprocess calls; CLAUDE.md's concurrency
+            # contract forbids holding _state_lock/_wake across blocking
+            # operations) AND off this thread: this is the single scheduler
+            # thread, so running them here would delay the next scheduling
+            # pass by however long the audit bookkeeping takes, directly
+            # hurting placement latency for other queued jobs. Best-effort
+            # bookkeeping: a job that reached its waiter is placed either
+            # way, whether or not this succeeds or how long it takes.
+            for event in placement_events:
+                threading.Thread(
+                    target=self._record_placement_event, args=(event,),
+                    daemon=True,
+                ).start()
 
-    def _run_schedule_pass_locked(self) -> None:
-        """Run one scheduling pass. Caller holds _state_lock (via _wake)."""
+    def _run_schedule_pass_locked(self) -> list:
+        """Run one scheduling pass. Caller holds _state_lock (via _wake).
+        Returns pending placement-event dicts (memory/utilization already
+        captured; process lists not yet fetched) for the caller to finish
+        and persist after releasing the lock."""
         self._refresh_live()
         queued_rows = self.db.queued_jobs_ordered()
         # Only consider jobs whose waiter is still connected.
@@ -369,9 +420,10 @@ class Daemon:
             for j in queued_rows if j.job_id in self._pending
         ]
         if not candidates:
-            return
+            return []
         running_counts = self.db.running_counts_by_user()
         held = self._gpus_held_by_user()
+        placement_events: list = []
 
         def commit(job: SchedJob, gpu_ids: List[int]) -> None:
             for idx in gpu_ids:
@@ -391,12 +443,24 @@ class Daemon:
                 self.state.release_job(job.job_id)
                 self.db.mark_failed(job.job_id, _now_iso())
                 self._pending.pop(job.job_id, None)
+                return
+            # Record what nvidia-smi showed on every managed GPU at the
+            # moment of this placement, for later diagnosis (see `gpuq
+            # audit`). Best-effort: a job that reached its waiter is placed
+            # either way, whether or not this bookkeeping succeeds.
+            placement_events.append({
+                "job_id": job.job_id, "user": job.user, "cmd": pending.job.cmd,
+                "gpus_requested": job.gpus_requested, "mem_requested": job.mem_requested,
+                "shareable": job.shareable, "gpu_ids": gpu_ids, "placed_at": _now_iso(),
+                "gpu_snapshot": self._gpu_memory_snapshot(),
+            })
 
         schedule_pass(
             candidates, self.state, running_counts, commit=commit,
             max_gpus_per_user=self.config.max_gpus_per_user,
             gpus_held_by_user=held,
         )
+        return placement_events
 
     def _gpus_held_by_user(self) -> Dict[str, int]:
         by_user: Dict[str, set] = {}
@@ -442,6 +506,23 @@ class Daemon:
         user = msg.get("user") if msg.get("mine") else None
         jobs = [self._job_to_dict(j, None) for j in self.db.history(limit, user)]
         protocol.send_msg(conn, protocol.history_response(jobs))
+
+    def _placement_event_to_dict(self, ev) -> dict:
+        from .sizeutil import format_size
+        return {
+            "job_id": ev.job_id, "user": ev.user, "cmd": ev.cmd,
+            "gpus_requested": ev.gpus_requested,
+            "mem_requested": ev.mem_requested,
+            "mem_requested_human": format_size(ev.mem_requested) if ev.mem_requested else None,
+            "shareable": ev.shareable, "gpu_ids": ev.gpu_ids,
+            "placed_at": ev.placed_at, "gpu_snapshot": ev.gpu_snapshot,
+        }
+
+    def _reply_audit(self, conn: socket.socket, msg) -> None:
+        job_id = msg.get("job_id")
+        events = self.db.placement_events_for_job(job_id)
+        protocol.send_msg(conn, protocol.audit_response(
+            [self._placement_event_to_dict(e) for e in events]))
 
     def _reply_cancel(self, conn: socket.socket, msg) -> None:
         job_id = msg.get("job_id")

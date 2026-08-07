@@ -1,26 +1,61 @@
 #!/usr/bin/env python3
 """Fake nvidia-smi shim for testing gpuq.
 
-Reads GPU state from the file pointed to by the GPUQ_FAKE_GPUS environment
-variable and writes it verbatim to stdout, then exits 0.
+Branches on which query was requested:
 
-If GPUQ_FAKE_GPUS is unset, prints a single default GPU line.
-If GPUQ_FAKE_GPUS is set but the file does not exist, prints an error to
-stderr and exits 1 (exercises the failure path in query_gpus).
+- ``--query-gpu=...``: reads GPU state from the file pointed to by
+  GPUQ_FAKE_GPUS and writes it verbatim to stdout, then exits 0.
+  If GPUQ_FAKE_GPUS is unset, prints a single default GPU line.
+  If GPUQ_FAKE_GPUS is set but the file does not exist, prints an error to
+  stderr and exits 1 (exercises the failure path in query_gpus).
 
-The state file must contain lines in the exact format nvidia-smi produces
-for --format=csv,noheader,nounits:
-    index, used_MiB, total_MiB, free_MiB
+  The state file must contain lines in the exact format nvidia-smi produces
+  for --format=csv,noheader,nounits:
+      index, used_MiB, total_MiB, free_MiB, utilization_pct
+
+- ``--query-compute-apps=...`` (always paired with ``--id=<index>``): reads
+  the process list for that GPU index from the file pointed to by
+  GPUQ_FAKE_PROCS_<index> (or GPUQ_FAKE_PROCS as a fallback shared across all
+  indices), and writes it verbatim to stdout. Missing/unset env vars mean "no
+  processes on this GPU" (empty output), which is the common case, not an
+  error.
+
+  The state file must contain lines in the format:
+      pid, process_name, used_memory_MiB
 """
 
 import os
+import re
 import sys
 
+args = sys.argv[1:]
+is_compute_apps = any(a.startswith("--query-compute-apps") for a in args)
+
+if is_compute_apps:
+    gpu_id = None
+    for a in args:
+        m = re.match(r"--id=(\d+)", a)
+        if m:
+            gpu_id = m.group(1)
+    state_file = None
+    if gpu_id is not None:
+        state_file = os.environ.get(f"GPUQ_FAKE_PROCS_{gpu_id}")
+    if state_file is None:
+        state_file = os.environ.get("GPUQ_FAKE_PROCS")
+    if state_file is None:
+        sys.exit(0)  # no processes configured for this GPU
+    if not os.path.exists(state_file):
+        sys.exit(0)
+    with open(state_file) as fh:
+        sys.stdout.write(fh.read())
+    sys.exit(0)
+
+# --query-gpu path
 state_file = os.environ.get("GPUQ_FAKE_GPUS")
 
 if state_file is None:
     # No file configured — emit a single default GPU line.
-    print("0, 0, 24576, 24576")
+    print("0, 0, 24576, 24576, 0")
     sys.exit(0)
 
 if not os.path.exists(state_file):

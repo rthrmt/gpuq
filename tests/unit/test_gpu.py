@@ -5,7 +5,14 @@ from __future__ import annotations
 import os
 import pytest
 
-from gpuq.gpu import GpuInfo, NvidiaSmiError, parse_csv, query_gpus
+from gpuq.gpu import (
+    GpuInfo,
+    GpuProcess,
+    NvidiaSmiError,
+    parse_compute_apps_csv,
+    parse_csv,
+    query_gpus,
+)
 
 _MIB = 1024 * 1024
 
@@ -19,7 +26,7 @@ _FAKEBIN = os.path.join(os.path.dirname(__file__), "..", "fakebin", "nvidia-smi"
 
 
 def test_parse_csv_single_gpu():
-    text = "0, 512, 24576, 24064\n"
+    text = "0, 512, 24576, 24064, 10\n"
     gpus = parse_csv(text)
     assert len(gpus) == 1
     g = gpus[0]
@@ -27,13 +34,14 @@ def test_parse_csv_single_gpu():
     assert g.mem_used == 512 * _MIB
     assert g.mem_total == 24576 * _MIB
     assert g.mem_free == 24064 * _MIB
+    assert g.utilization_pct == 10
 
 
 def test_parse_csv_multi_gpu():
     text = (
-        "0, 100, 8192, 8092\n"
-        "1, 200, 16384, 16184\n"
-        "2, 300, 24576, 24276\n"
+        "0, 100, 8192, 8092, 0\n"
+        "1, 200, 16384, 16184, 25\n"
+        "2, 300, 24576, 24276, 99\n"
     )
     gpus = parse_csv(text)
     assert len(gpus) == 3
@@ -41,13 +49,15 @@ def test_parse_csv_multi_gpu():
     assert gpus[0].mem_used == 100 * _MIB
     assert gpus[1].index == 1
     assert gpus[1].mem_total == 16384 * _MIB
+    assert gpus[1].utilization_pct == 25
     assert gpus[2].index == 2
     assert gpus[2].mem_free == 24276 * _MIB
+    assert gpus[2].utilization_pct == 99
 
 
 def test_parse_csv_byte_conversion():
     """1 MiB == 1 048 576 bytes."""
-    text = "0, 1, 1, 0\n"
+    text = "0, 1, 1, 0, 0\n"
     gpus = parse_csv(text)
     assert gpus[0].mem_used == 1_048_576
     assert gpus[0].mem_total == 1_048_576
@@ -61,14 +71,15 @@ def test_parse_csv_byte_conversion():
 
 def test_parse_csv_whitespace_tolerance():
     """Extra spaces around fields must be stripped."""
-    text = "  0 ,  256 ,  8192 ,  7936 \n"
+    text = "  0 ,  256 ,  8192 ,  7936 ,  5 \n"
     gpus = parse_csv(text)
     assert len(gpus) == 1
     assert gpus[0].mem_used == 256 * _MIB
+    assert gpus[0].utilization_pct == 5
 
 
 def test_parse_csv_blank_lines_skipped():
-    text = "\n0, 0, 8192, 8192\n\n1, 64, 8192, 8128\n\n"
+    text = "\n0, 0, 8192, 8192, 0\n\n1, 64, 8192, 8128, 0\n\n"
     gpus = parse_csv(text)
     assert len(gpus) == 2
     assert gpus[0].index == 0
@@ -89,31 +100,45 @@ def test_parse_csv_only_blank_lines():
 
 
 def test_parse_csv_na_used_treated_as_zero():
-    text = "0, N/A, 8192, 8192\n"
+    text = "0, N/A, 8192, 8192, 0\n"
     gpus = parse_csv(text)
     assert len(gpus) == 1
     assert gpus[0].mem_used == 0
 
 
 def test_parse_csv_bracketed_na_treated_as_zero():
-    text = "0, [N/A], 8192, [N/A]\n"
+    text = "0, [N/A], 8192, [N/A], [N/A]\n"
     gpus = parse_csv(text)
     assert len(gpus) == 1
     assert gpus[0].mem_used == 0
     assert gpus[0].mem_free == 0
+    assert gpus[0].utilization_pct == 0
 
 
 def test_parse_csv_na_index_line_skipped():
-    text = "N/A, 0, 8192, 8192\n0, 64, 8192, 8128\n"
+    text = "N/A, 0, 8192, 8192, 0\n0, 64, 8192, 8128, 0\n"
     gpus = parse_csv(text)
     assert len(gpus) == 1
     assert gpus[0].index == 0
 
 
 def test_parse_csv_bracketed_na_index_skipped():
-    text = "[N/A], 0, 8192, 8192\n"
+    text = "[N/A], 0, 8192, 8192, 0\n"
     gpus = parse_csv(text)
     assert gpus == []
+
+
+# ---------------------------------------------------------------------------
+# parse_csv — malformed lines
+# ---------------------------------------------------------------------------
+
+
+def test_parse_csv_wrong_column_count_skipped():
+    """A line with the old 4-column format (no utilization) is malformed now."""
+    text = "0, 0, 8192, 8192\n1, 0, 8192, 8192, 5\n"
+    gpus = parse_csv(text)
+    assert len(gpus) == 1
+    assert gpus[0].index == 1
 
 
 # ---------------------------------------------------------------------------
@@ -122,26 +147,26 @@ def test_parse_csv_bracketed_na_index_skipped():
 
 
 def test_parse_csv_managed_filter_keeps_only_selected():
-    text = "0, 0, 8192, 8192\n1, 0, 8192, 8192\n2, 0, 8192, 8192\n3, 0, 8192, 8192\n"
+    text = "0, 0, 8192, 8192, 0\n1, 0, 8192, 8192, 0\n2, 0, 8192, 8192, 0\n3, 0, 8192, 8192, 0\n"
     gpus = parse_csv(text, managed=[1, 3])
     assert [g.index for g in gpus] == [1, 3]
 
 
 def test_parse_csv_managed_filter_ascending_order():
     """Result is sorted ascending even if managed is given in descending order."""
-    text = "0, 0, 8192, 8192\n1, 0, 8192, 8192\n2, 0, 8192, 8192\n"
+    text = "0, 0, 8192, 8192, 0\n1, 0, 8192, 8192, 0\n2, 0, 8192, 8192, 0\n"
     gpus = parse_csv(text, managed=[2, 0])
     assert [g.index for g in gpus] == [0, 2]
 
 
 def test_parse_csv_managed_filter_none_keeps_all():
-    text = "0, 0, 8192, 8192\n1, 0, 8192, 8192\n"
+    text = "0, 0, 8192, 8192, 0\n1, 0, 8192, 8192, 0\n"
     gpus = parse_csv(text, managed=None)
     assert len(gpus) == 2
 
 
 def test_parse_csv_managed_filter_empty_set():
-    text = "0, 0, 8192, 8192\n1, 0, 8192, 8192\n"
+    text = "0, 0, 8192, 8192, 0\n1, 0, 8192, 8192, 0\n"
     gpus = parse_csv(text, managed=[])
     assert gpus == []
 
@@ -153,9 +178,53 @@ def test_parse_csv_managed_filter_empty_set():
 
 def test_parse_csv_result_sorted_by_index():
     """Even if nvidia-smi reports GPUs out of order, result is sorted."""
-    text = "3, 0, 8192, 8192\n1, 0, 8192, 8192\n0, 0, 8192, 8192\n"
+    text = "3, 0, 8192, 8192, 0\n1, 0, 8192, 8192, 0\n0, 0, 8192, 8192, 0\n"
     gpus = parse_csv(text)
     assert [g.index for g in gpus] == [0, 1, 3]
+
+
+# ---------------------------------------------------------------------------
+# parse_compute_apps_csv
+# ---------------------------------------------------------------------------
+
+
+def test_parse_compute_apps_csv_single_process():
+    text = "1234, python, 2048\n"
+    procs = parse_compute_apps_csv(text)
+    assert procs == [GpuProcess(pid=1234, process_name="python", used_memory=2048 * _MIB)]
+
+
+def test_parse_compute_apps_csv_multiple_processes():
+    text = "1234, python, 2048\n5678, some_training_job, 4096\n"
+    procs = parse_compute_apps_csv(text)
+    assert len(procs) == 2
+    assert procs[0].pid == 1234
+    assert procs[1].pid == 5678
+    assert procs[1].used_memory == 4096 * _MIB
+
+
+def test_parse_compute_apps_csv_empty_is_no_processes():
+    """No compute processes on the GPU is the common case, not an error."""
+    assert parse_compute_apps_csv("") == []
+
+
+def test_parse_compute_apps_csv_blank_lines_skipped():
+    text = "\n1234, python, 100\n\n"
+    procs = parse_compute_apps_csv(text)
+    assert len(procs) == 1
+
+
+def test_parse_compute_apps_csv_na_pid_skipped():
+    text = "N/A, python, 100\n1234, python, 100\n"
+    procs = parse_compute_apps_csv(text)
+    assert len(procs) == 1
+    assert procs[0].pid == 1234
+
+
+def test_parse_compute_apps_csv_na_used_memory_treated_as_zero():
+    text = "1234, python, N/A\n"
+    procs = parse_compute_apps_csv(text)
+    assert procs[0].used_memory == 0
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +235,7 @@ def test_parse_csv_result_sorted_by_index():
 def test_query_gpus_with_fake_shim(tmp_path, monkeypatch):
     """query_gpus returns correct GpuInfo when pointed at the fake shim."""
     state_file = tmp_path / "gpus.txt"
-    state_file.write_text("0, 512, 24576, 24064\n1, 1024, 24576, 23552\n")
+    state_file.write_text("0, 512, 24576, 24064, 12\n1, 1024, 24576, 23552, 50\n")
 
     monkeypatch.setenv("GPUQ_NVIDIA_SMI", os.path.abspath(_FAKEBIN))
     monkeypatch.setenv("GPUQ_FAKE_GPUS", str(state_file))
@@ -179,12 +248,14 @@ def test_query_gpus_with_fake_shim(tmp_path, monkeypatch):
         mem_used=512 * _MIB,
         mem_total=24576 * _MIB,
         mem_free=24064 * _MIB,
+        utilization_pct=12,
     )
     assert gpus[1] == GpuInfo(
         index=1,
         mem_used=1024 * _MIB,
         mem_total=24576 * _MIB,
         mem_free=23552 * _MIB,
+        utilization_pct=50,
     )
 
 

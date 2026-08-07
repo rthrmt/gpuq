@@ -465,6 +465,71 @@ def cmd_history(args, sock_path: str) -> int:
     return 0
 
 
+# --- audit -------------------------------------------------------------
+
+def _resolve_job_id(prefix: str, sock_path: str) -> Optional[str]:
+    """Resolve a (possibly short) job id prefix to a full job id, checking
+    the active queue first and falling back to history for finished jobs."""
+    try:
+        for j in _query_status(sock_path):
+            if j["job_id"].startswith(prefix):
+                return j["job_id"]
+    except OSError:
+        pass
+    try:
+        conn = _connect(sock_path)
+        protocol.send_msg(conn, protocol.history(200, False, None))
+        reply = protocol.recv_one(conn)
+        conn.close()
+        for j in (reply or {}).get("jobs", []):
+            if j["job_id"].startswith(prefix):
+                return j["job_id"]
+    except OSError:
+        pass
+    return None
+
+
+def cmd_audit(args, sock_path: str) -> int:
+    job_id = _resolve_job_id(args.job_id, sock_path)
+    if job_id is None:
+        _die(f"no job found matching {args.job_id}")
+    try:
+        conn = _connect(sock_path)
+    except OSError as exc:
+        _die(f"cannot reach gpuqd at {sock_path}: {exc}")
+    protocol.send_msg(conn, protocol.audit(job_id))
+    reply = protocol.recv_one(conn)
+    conn.close()
+    events = (reply or {}).get("events", [])
+    if not events:
+        print(f"No placement events recorded for job {_short(job_id)}.")
+        return 0
+    for ev in events:
+        gpu_ids = ",".join(str(g) for g in ev.get("gpu_ids", []))
+        print(f"Job {_short(job_id)} placed at {ev.get('placed_at')} on GPU(s) {gpu_ids}")
+        print(f"  cmd: {ev.get('cmd')}")
+        mem_h = ev.get("mem_requested_human")
+        if mem_h:
+            print(f"  requested: {mem_h}"
+                  f"{' (shared)' if ev.get('shareable') else ''}")
+        print(f"  {'GPU':<5}{'USED':<10}{'FREE':<10}{'TOTAL':<10}{'UTIL':<6}PROCESSES")
+        for g in ev.get("gpu_snapshot", []):
+            procs = g.get("processes") or []
+            proc_s = ", ".join(
+                f"{p.get('pid')}:{p.get('process_name')}"
+                f"({format_size(p.get('used_memory', 0))})"
+                for p in procs
+            ) or "-"
+            print(f"  {g.get('index'):<5}"
+                  f"{format_size(g.get('mem_used', 0)):<10}"
+                  f"{format_size(g.get('mem_free', 0)):<10}"
+                  f"{format_size(g.get('mem_total', 0)):<10}"
+                  f"{str(g.get('utilization_pct', 0)) + '%':<6}"
+                  f"{proc_s}")
+        print()
+    return 0
+
+
 # --- argparse --------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -504,6 +569,10 @@ def build_parser() -> argparse.ArgumentParser:
     hi.add_argument("--limit", type=int, default=20, help="max rows (default 20)")
     hi.add_argument("--mine", action="store_true", help="only your jobs")
     hi.set_defaults(func=cmd_history)
+
+    au = sub.add_parser("audit", help="show GPU state at the moment a job was placed")
+    au.add_argument("job_id", help="job id (prefix ok)")
+    au.set_defaults(func=cmd_audit)
     return p
 
 

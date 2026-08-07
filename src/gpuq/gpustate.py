@@ -86,6 +86,12 @@ class GpuState:
                 if expected == 0 and g.mem_used > self.idle_threshold_bytes:
                     pass  # exclusive job legitimately uses the card; no warning
 
+    def snapshot(self) -> List[GpuInfo]:
+        """Live nvidia-smi state as of the most recent reconcile(), across
+        all managed GPUs. Used to record what the scheduler saw at the
+        moment of a placement decision."""
+        return list(self._live.values())
+
     @property
     def managed_indices(self) -> List[int]:
         return sorted(self._slots)

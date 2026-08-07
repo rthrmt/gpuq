@@ -3,8 +3,10 @@
 The ``daemon`` fixture launches a real ``gpuqd`` in a subprocess against a temp
 Unix socket and a temp SQLite DB, with ``nvidia-smi`` replaced by the fake shim
 in ``tests/fakebin/nvidia-smi``. The shim reads its GPU state from a file the
-test controls via ``GPUQ_FAKE_GPUS``, so a test can simulate any GPU layout
-without real hardware.
+test controls via ``GPUQ_FAKE_GPUS`` (see ``DaemonHandle.set_gpus``), and any
+fake per-GPU compute-process list via ``GPUQ_FAKE_PROCS_<index>`` (see
+``DaemonHandle.set_procs``), so a test can simulate any GPU layout without
+real hardware.
 """
 
 import os
@@ -24,8 +26,23 @@ GB = 1024  # the shim file uses MiB; 1024 MiB = 1 GiB
 
 
 def write_gpus(path, gpus):
-    """gpus: list of (index, used_mib, total_mib, free_mib)."""
-    lines = [f"{i}, {u}, {t}, {f}" for (i, u, t, f) in gpus]
+    """gpus: list of (index, used_mib, total_mib, free_mib) or
+    (index, used_mib, total_mib, free_mib, utilization_pct). The 4-tuple form
+    defaults utilization_pct to 0."""
+    lines = []
+    for entry in gpus:
+        if len(entry) == 4:
+            i, u, t, f = entry
+            util = 0
+        else:
+            i, u, t, f, util = entry
+        lines.append(f"{i}, {u}, {t}, {f}, {util}")
+    Path(path).write_text("\n".join(lines) + "\n")
+
+
+def write_procs(path, procs):
+    """procs: list of (pid, process_name, used_mib)."""
+    lines = [f"{pid}, {name}, {mib}" for (pid, name, mib) in procs]
     Path(path).write_text("\n".join(lines) + "\n")
 
 
@@ -38,11 +55,12 @@ def gpu_state_file(tmp_path):
 
 
 class DaemonHandle:
-    def __init__(self, socket_path, gpu_state_file, proc, db_path):
+    def __init__(self, socket_path, gpu_state_file, proc, db_path, tmp_path):
         self.socket_path = socket_path
         self.gpu_state_file = gpu_state_file
         self.proc = proc
         self.db_path = db_path
+        self._tmp_path = tmp_path
 
     def connect(self):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -61,6 +79,13 @@ class DaemonHandle:
 
     def set_gpus(self, gpus):
         write_gpus(self.gpu_state_file, gpus)
+
+    def set_procs(self, index, procs):
+        """Set the fake compute-process list nvidia-smi reports for GPU
+        ``index``. The daemon subprocess has GPUQ_FAKE_PROCS_<index> pointed
+        at a fixed path per index (see the `daemon` fixture), so this just
+        (re)writes that file's contents."""
+        write_procs(self._tmp_path / f"procs_{index}.txt", procs)
 
 
 def _wait_for_socket(path, timeout=5.0):
@@ -89,6 +114,12 @@ def daemon(tmp_path, gpu_state_file):
     env["GPUQ_DB"] = db_path
     env["GPUQ_NVIDIA_SMI"] = str(FAKE_SMI)
     env["GPUQ_FAKE_GPUS"] = str(gpu_state_file)
+    # Fixed per-index process-list paths (a real nvidia-smi is queried once
+    # per GPU via --id=<index>); tests write to these via DaemonHandle.set_procs.
+    # A path that doesn't exist yet is fine -- the shim treats that as "no
+    # processes on this GPU", the common case.
+    for i in range(8):
+        env[f"GPUQ_FAKE_PROCS_{i}"] = str(tmp_path / f"procs_{i}.txt")
     # Fast poll so external GPU changes / rescheduling are picked up quickly.
     env["PYTHONPATH"] = str(REPO / "src") + os.pathsep + env.get("PYTHONPATH", "")
 
@@ -100,7 +131,7 @@ def daemon(tmp_path, gpu_state_file):
         out = proc.stdout.read().decode() if proc.stdout else ""
         proc.kill()
         pytest.fail(f"daemon did not start. output:\n{out}")
-    handle = DaemonHandle(socket_path, gpu_state_file, proc, db_path)
+    handle = DaemonHandle(socket_path, gpu_state_file, proc, db_path, tmp_path)
     yield handle
     proc.terminate()
     try:
