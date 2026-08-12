@@ -20,23 +20,23 @@ prioritisation engine, or a hard memory enforcer.
 
 ```
 User shell                Background waiter            Daemon (root)
-    |                           |                           |
-    | gpuq submit "cmd"         |                           |
-    |-------------------------->| fork, parent returns       |
-    |  (shell free immediately) |                           |
-    |                           |-- register(job) --------->|
-    |                           |   (blocks, waiting)       | (queues job)
-    |                           |                           |
-    |                           |                           | GPU becomes free
-    |                           |                           | fairness check
+    |                           |                                  |
+    | gpuq submit "cmd"         |                                  |
+    |-------------------------->| fork, parent returns             |
+    |  (shell free immediately) |                                  |
+    |                           |-- register(job) ---------------->|
+    |                           |   (blocks, waiting)              | (queues job)
+    |                           |                                  |
+    |                           |                                  | GPU becomes free
+    |                           |                                  | fairness check
     |                           |<-- go(CUDA_VISIBLE_DEVICES=N) ---|
-    |                           |                           |
-    |                           | redirect stdout/stderr    |
-    |                           | to log file               |
-    |                           | exec(cmd) as self         |
-    |                           | ...job runs...            |
-    |                           |-- done(job_id, exit_code)->|
-    |                           | exit                      | (GPU freed)
+    |                           |                                  |
+    |                           | redirect stdout/stderr           |
+    |                           | to log file                      |
+    |                           | exec(cmd) as self                |
+    |                           | ...job runs...                   |
+    |                           |-- done(job_id, exit_code)------->|
+    |                           | exit                             | (GPU freed)
 ```
 
 **Key property:** The daemon never spawns or owns user processes. The
