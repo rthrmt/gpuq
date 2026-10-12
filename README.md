@@ -84,7 +84,9 @@ The installer:
   does not already exist)
 
 End users do **not** need a virtualenv: `gpuq` is on the system `PATH` and the
-runtime is stdlib-only. To upgrade, re-run `sudo ./install.sh`; to remove,
+runtime is stdlib-only. To upgrade, re-run `sudo ./install.sh`: it installs the
+new version and restarts the daemon. Queued and running jobs carry over — see
+[Daemon restarts and upgrades](#daemon-restarts-and-upgrades). To remove,
 delete `/opt/gpuq`, the two `/usr/local/bin` symlinks, and the systemd unit.
 
 The socket at `/run/gpuq/gpuq.sock` is created world-accessible (mode `0666`)
@@ -126,6 +128,7 @@ All subcommands support `--socket <path>` to override the socket location.
 
 ```
 gpuq submit <command> [--name NAME] [--gpus N] [--mem SIZE] [--share]
+                      [--priority N | --top]
 ```
 
 The shell returns immediately after the job is accepted. A background waiter
@@ -157,6 +160,8 @@ gpuq submit "python eval.py" --name eval --gpus 1 --mem 8G --share
 | `--gpus N` | `1` | Number of GPUs required (multi-GPU is atomic: all N or none) |
 | `--mem SIZE` | none | Per-GPU memory hint/requirement, e.g. `8G`, `512M`, `1.5G`. Unit suffix required. For exclusive jobs, steers best-fit only. For `--share` jobs, required and enforced by placement logic. |
 | `--share` | off | Allow co-location with other `--share` jobs. Requires `--mem`. |
+| `--priority N` | `0` | Order among **your own** queued jobs; higher runs first. See [`priority`](#priority--reorder-your-own-queued-jobs). |
+| `--top` | off | Queue this job ahead of all your other queued jobs (instead of `--priority`). |
 
 #### Using your own virtualenv / conda environment
 
@@ -194,11 +199,14 @@ gpuq status --mine    # your jobs only, with a summary line
 ```
 
 ```
-ID      USER     STATUS    POS  GPU  SUBMITTED         STARTED           NAME/CMD
-7a3f    alice    queued    1    -    2026-05-16 14:30  -                 baseline
-3b1c    bob      running   -    0    2026-05-16 14:15  2026-05-16 14:20  ./finetune.sh
-9d2a    carol    running   -    1    2026-05-16 14:22  2026-05-16 14:25  python eval.py
+ID      USER     STATUS    POS  PRIO  GPU  SUBMITTED         STARTED           NAME/CMD
+3b1c    bob      running   -    -     0    2026-05-16 14:15  2026-05-16 14:20  ./finetune.sh
+9d2a    carol    running   -    -     1    2026-05-16 14:22  2026-05-16 14:25  python eval.py
+7a3f    alice    queued    1    -     -    2026-05-16 14:30  -                 baseline
 ```
+
+Running jobs come first, then the queue in order. `POS` is the position in the
+queue; `PRIO` shows a queued job's priority when it is not the default `0`.
 
 ### `mine` — your jobs with summary
 
@@ -208,9 +216,9 @@ Shorthand for `gpuq status --mine`, always includes the summary line.
 gpuq mine
 # Your jobs: 1 running, 1 queued
 #
-# ID      STATUS    POS  GPU  SUBMITTED         STARTED           NAME/CMD
-# 7a3f    queued    1    -    2026-05-16 14:30  -                 baseline
-# 3b1c    running   -    0    2026-05-16 14:15  2026-05-16 14:20  finetune
+# ID      STATUS    POS  PRIO  GPU  SUBMITTED         STARTED           NAME/CMD
+# 3b1c    running   -    -     0    2026-05-16 14:15  2026-05-16 14:20  finetune
+# 7a3f    queued    1    -     -    2026-05-16 14:30  -                 baseline
 ```
 
 ### `logs` — view a job's output
@@ -263,6 +271,29 @@ gpuq cancel 7a3f --force
 
 `--all` only ever touches **queued** jobs; it will not kill anything running.
 
+### `priority` — reorder your own queued jobs
+
+Move a queued job up or down **your own** queue without cancelling anything.
+Users can only reprioritize their own jobs; root can reprioritize any job.
+`prio` is accepted as a short alias.
+
+```bash
+gpuq priority 7a3f --top   # ahead of all your other queued jobs
+# Job 7a3f (baseline) priority 0 -> 1, now position 1 in the queue
+gpuq priority 7a3f 5       # set an explicit priority (higher runs first)
+gpuq priority 7a3f -1      # behind your default-priority jobs
+gpuq priority 7a3f 0       # back to normal
+```
+
+Every job starts at priority `0` (or whatever `submit --priority` / `--top`
+gave it). Among your queued jobs the highest priority goes first; equal
+priorities stay in submission order. `--top` picks one more than the highest
+priority among your other queued jobs.
+
+Priority never moves you ahead of **other users** — see
+[Priority](#priority) below. Only queued jobs can be reprioritized; a running
+job is already running.
+
 ### `history` — recently finished jobs
 
 ```bash
@@ -304,6 +335,19 @@ any single user from monopolising all GPUs.
 After one job is placed, the counts are updated and the ordering is
 re-evaluated before placing the next, so fairness applies across a whole
 batch of placements in a single scheduler pass.
+
+### Priority
+
+A priority only decides which of **your own** queued jobs goes next. Each
+queued job gives its owner one place in the FIFO order (its submission time);
+the owner's jobs fill those places highest-priority first. Promoting a job
+therefore swaps it with one of your earlier submissions — it takes the place
+your oldest queued job had — and every other user's jobs stay exactly where
+they were. There is nothing to gain by giving all your jobs a high priority.
+
+Priority is an ordering, not a reservation: "skip, don't block" still applies.
+If your top-priority job cannot be placed right now (say it needs 2 GPUs and
+only 1 is free), one of your lower-priority jobs that does fit may start first.
 
 ### Best-Fit Placement
 
@@ -357,6 +401,7 @@ socket_path = /run/gpuq/gpuq.sock
 db_path = /var/lib/gpuq/queue.db
 log_path = /var/log/gpuq/daemon.log
 poll_interval_seconds = 5
+# reattach_grace_seconds = 30
 # socket_mode = 0666    ; default: open to all local users (no group needed).
                         ; set tighter (e.g. 0660) + manage ownership to restrict.
 
@@ -374,6 +419,7 @@ max_gpus_per_user = 0    ; 0 = unlimited
 | `db_path` | `[daemon]` | `/var/lib/gpuq/queue.db` | SQLite database path |
 | `log_path` | `[daemon]` | `/var/log/gpuq/daemon.log` | Daemon log file |
 | `poll_interval_seconds` | `[daemon]` | `5` | How often the scheduler wakes to check GPU state even without new events |
+| `reattach_grace_seconds` | `[daemon]` | `30` | After a restart, how long the daemon waits for the jobs in its database to reattach before giving up on them. The queue is held meanwhile. |
 | `socket_mode` | `[daemon]` | `0666` | Octal permission mode for the socket; default is open to all local users |
 | `managed_gpus` | `[gpus]` | (all) | Comma-separated list of GPU indices to manage; omit to use all GPUs reported by nvidia-smi |
 | `idle_memory_threshold_mb` | `[gpus]` | `500` | A GPU whose live `nvidia-smi` memory use exceeds this is treated as occupied (not free for exclusive jobs) |
@@ -394,14 +440,36 @@ external process on the same GPU, can still cause an OOM that kills other
 co-located (`--share`) jobs. For strong isolation, use exclusive mode (the
 default).
 
-### Daemon restart marks in-flight jobs failed
+### Daemon restarts and upgrades
 
-If `gpuqd` is restarted (crash, `systemctl restart`) while jobs are running,
-those jobs are marked `failed` in the database on startup because there is no
-reconnect protocol between the daemon and the waiter processes. The underlying
-processes may keep running until they finish on their own (they will still
-produce output to their log files), but gpuq will no longer track them or
-free their GPU slots automatically.
+Restarting `gpuqd` — an upgrade, `systemctl restart`, a crash followed by
+systemd's automatic restart — does not lose jobs. Each job's background waiter
+process notices the dropped connection, reconnects, and tells the new daemon
+where its job stands:
+
+- **Queued jobs** keep their place in the queue, priority included.
+- **Running jobs** keep running and keep their GPUs reserved; they can still be
+  cancelled, and their exit code is recorded as usual.
+- **Jobs that finish while the daemon is down** report their exit code as soon
+  as it is back.
+
+After a restart the daemon holds the queue until every job it knows about has
+reattached, normally a second or two. Jobs that have not reattached after
+`reattach_grace_seconds` (default 30) are given up on: queued ones become
+`cancelled`, running ones `failed` (their process may still be running, but
+gpuq no longer tracks it or reserves its GPU). That only happens when the
+waiter process itself is gone, e.g. it was killed or the machine rebooted.
+
+Waiters keep trying to reach the daemon for 24 hours, so a longer maintenance
+stop is fine too; `gpuq` commands simply fail with `cannot reach gpuqd` in the
+meantime.
+
+**Upgrading from a version without this feature.** Jobs submitted with a gpuq
+older than this cannot reattach, so the restart that *introduces* it still
+loses whatever is queued or running at that moment. `install.sh` checks for
+this (`gpuqd --restart-check`) and, if jobs would be lost, installs the new
+version but leaves the old daemon running and tells you to restart it yourself
+once the queue is empty. Every later upgrade restarts on its own.
 
 ### Common issues
 
@@ -427,8 +495,9 @@ Run `gpuq status` and check GPU occupancy with `nvidia-smi`.
 
 **Log file is empty or missing**
 The job may not have started yet (still `queued`). If it shows `running`, the
-log is at the path printed by `submit`. If it shows `failed` immediately after
-submission, check whether the daemon was restarted while it was running.
+log is at the path printed by `submit`. If a job shows `failed` with no exit
+code, gpuq lost track of it: its waiter process died, or did not reattach after
+a daemon restart (see [Daemon restarts and upgrades](#daemon-restarts-and-upgrades)).
 
 ---
 

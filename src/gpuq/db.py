@@ -4,7 +4,8 @@ A single :class:`Database` instance owns one connection guarded by a lock, so
 it is safe to call from the daemon's several threads. Rows are returned as
 :class:`Job` dataclasses. The daemon treats the DB as the durable record of
 truth for *what jobs exist and their status*; the live GPU reservation model
-(:mod:`gpuq.gpustate`) is rebuilt from ``running`` rows on startup.
+(:mod:`gpuq.gpustate`) is rebuilt from ``running`` rows on startup, and the
+waiters of the ``queued``/``running`` rows are expected to reattach.
 """
 
 import json
@@ -38,7 +39,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     submitted_at   TEXT NOT NULL,
     started_at     TEXT,
     finished_at    TEXT,
-    exit_code      INTEGER
+    exit_code      INTEGER,
+    priority       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_status    ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_user      ON jobs(user);
@@ -77,6 +79,7 @@ class Job:
     started_at: Optional[str]
     finished_at: Optional[str]
     exit_code: Optional[int]
+    priority: int = 0              # higher runs first among the owner's queued jobs
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Job":
@@ -96,6 +99,7 @@ class Job:
             started_at=row["started_at"],
             finished_at=row["finished_at"],
             exit_code=row["exit_code"],
+            priority=row["priority"],
         )
 
 
@@ -142,7 +146,19 @@ class Database:
     def init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves an existing table untouched, so a
+        database written by an older gpuq lacks them. Caller holds the lock.
+        """
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+        if "priority" not in cols:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         with self._lock:
@@ -162,17 +178,30 @@ class Database:
         shareable: bool,
         log_file: str,
         submitted_at: str,
+        priority: int = 0,
     ) -> None:
         with self._lock:
             self._conn.execute(
                 """INSERT INTO jobs (job_id, user, name, cmd, gpus_requested,
                        mem_requested, shareable, gpu_ids, status, log_file,
-                       submitted_at, started_at, finished_at, exit_code)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL)""",
+                       submitted_at, started_at, finished_at, exit_code, priority)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, ?)""",
                 (job_id, user, name, cmd, gpus_requested, mem_requested,
-                 1 if shareable else 0, QUEUED, log_file, submitted_at),
+                 1 if shareable else 0, QUEUED, log_file, submitted_at, priority),
             )
             self._conn.commit()
+
+    def set_priority(self, job_id: str, priority: int) -> bool:
+        """Set a *queued* job's priority. Returns False if it is no longer
+        queued (the status check and the write are one statement, so a job the
+        scheduler just started cannot be reprioritized after the fact)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE jobs SET priority=? WHERE job_id=? AND status=?",
+                (priority, job_id, QUEUED),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def mark_running(self, job_id: str, gpu_ids: List[int], started_at: str) -> None:
         with self._lock:
@@ -231,21 +260,6 @@ class Database:
             )
             self._conn.commit()
 
-    def fail_all_running(self, finished_at: str) -> List[str]:
-        """Crash recovery: mark every ``running`` job ``failed``. Returns ids."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT job_id FROM jobs WHERE status=?", (RUNNING,)
-            ).fetchall()
-            ids = [r["job_id"] for r in rows]
-            if ids:
-                self._conn.execute(
-                    "UPDATE jobs SET status=?, finished_at=? WHERE status=?",
-                    (FAILED, finished_at, RUNNING),
-                )
-                self._conn.commit()
-            return ids
-
     # --- reads ------------------------------------------------------------
 
     def get_job(self, job_id: str) -> Optional[Job]:
@@ -272,6 +286,18 @@ class Database:
                 (QUEUED,),
             ).fetchall()
         return [Job.from_row(r) for r in rows]
+
+    def max_queued_priority(self, user: str,
+                            exclude_job_id: Optional[str] = None) -> Optional[int]:
+        """Highest priority among ``user``'s queued jobs (optionally ignoring
+        one of them), or ``None`` if there are none."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(priority) AS p FROM jobs "
+                "WHERE status=? AND user=? AND job_id IS NOT ?",
+                (QUEUED, user, exclude_job_id),
+            ).fetchone()
+        return row["p"]
 
     def running_jobs(self) -> List[Job]:
         with self._lock:

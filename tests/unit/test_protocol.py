@@ -79,6 +79,25 @@ def test_register_builder_fields():
     assert msg["shareable"] is True
 
 
+def test_register_builder_priority_defaults():
+    base = dict(job_id="j", user="u", cmd="c", name="n", gpus_requested=1,
+                mem_requested=None, shareable=False, log_file="/l", submitted_at="t")
+    plain = protocol.register(**base)
+    assert plain["priority"] == 0 and plain["top"] is False
+    urgent = protocol.register(priority=5, top=True, **base)
+    assert urgent["priority"] == 5 and urgent["top"] is True
+
+
+def test_prioritize_builders():
+    msg = protocol.prioritize("j", "alice", priority=3)
+    assert msg == {"type": "prioritize", "job_id": "j", "requesting_user": "alice",
+                   "priority": 3, "top": False}
+    assert protocol.prioritize("j", "alice", top=True)["priority"] is None
+    reply = protocol.prioritize_response(3, 0, 1, "name")
+    assert reply == {"type": "prioritize_response", "priority": 3, "previous": 0,
+                     "queue_position": 1, "name": "name"}
+
+
 def test_get_type_requires_string():
     with pytest.raises(ProtocolError):
         protocol.get_type({"no": "type"})

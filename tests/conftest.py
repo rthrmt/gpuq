@@ -10,6 +10,7 @@ real hardware.
 """
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -55,12 +56,48 @@ def gpu_state_file(tmp_path):
 
 
 class DaemonHandle:
-    def __init__(self, socket_path, gpu_state_file, proc, db_path, tmp_path):
+    def __init__(self, socket_path, gpu_state_file, db_path, tmp_path, env):
         self.socket_path = socket_path
         self.gpu_state_file = gpu_state_file
-        self.proc = proc
+        self.proc = None
         self.db_path = db_path
         self._tmp_path = tmp_path
+        self._env = env
+        self._starts = 0
+
+    def start(self):
+        """Launch gpuqd; fails the test if it does not come up."""
+        self._starts += 1
+        self.log_path = self._tmp_path / f"daemon_{self._starts}.log"
+        with open(self.log_path, "wb") as log:
+            self.proc = subprocess.Popen(
+                [sys.executable, "-m", "gpuq.daemon", "--socket", self.socket_path,
+                 "--db", self.db_path],
+                env=self._env, stdout=log, stderr=subprocess.STDOUT,
+            )
+        if not _wait_for_socket(self.socket_path):
+            self.proc.kill()
+            pytest.fail(f"daemon did not start. output:\n{self.log_path.read_text()}")
+
+    def stop(self, sig=signal.SIGTERM):
+        """Stop gpuqd the way `systemctl stop` (SIGTERM) or a crash (SIGKILL)
+        would, and wait until it is gone."""
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        self.proc.send_signal(sig)
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+
+    def restart(self, sig=signal.SIGTERM):
+        self.stop(sig)
+        self.start()
+
+    def log(self):
+        """Output of the currently running (most recently started) gpuqd."""
+        return self.log_path.read_text()
 
     def connect(self):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -120,24 +157,15 @@ def daemon(tmp_path, gpu_state_file):
     # processes on this GPU", the common case.
     for i in range(8):
         env[f"GPUQ_FAKE_PROCS_{i}"] = str(tmp_path / f"procs_{i}.txt")
-    # Fast poll so external GPU changes / rescheduling are picked up quickly.
+    # Short grace period: after a restart, jobs whose waiter does not reattach
+    # are given up on after this long (waiters retry within a second or two).
+    env.setdefault("GPUQ_REATTACH_GRACE", "4")
     env["PYTHONPATH"] = str(REPO / "src") + os.pathsep + env.get("PYTHONPATH", "")
 
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "gpuq.daemon", "--socket", socket_path, "--db", db_path],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    if not _wait_for_socket(socket_path):
-        out = proc.stdout.read().decode() if proc.stdout else ""
-        proc.kill()
-        pytest.fail(f"daemon did not start. output:\n{out}")
-    handle = DaemonHandle(socket_path, gpu_state_file, proc, db_path, tmp_path)
+    handle = DaemonHandle(socket_path, gpu_state_file, db_path, tmp_path, env)
+    handle.start()
     yield handle
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    handle.stop()
 
 
 @pytest.fixture
@@ -152,19 +180,22 @@ def submit(daemon):
 
     forked = []
 
-    def _submit(cmd, *, name=None, gpus=1, mem=None, share=False, user="tester"):
+    def _submit(cmd, *, name=None, gpus=1, mem=None, share=False, user="tester",
+                priority=0, top=False, submitted_at=None):
         from gpuq import cli
         from gpuq.sizeutil import parse_size
 
         job_id = str(uuid.uuid4())
         mem_bytes = parse_size(mem) if mem else None
         log_file = str(Path(daemon.socket_path).parent / f"{job_id}.log")
-        submitted_at = datetime.datetime.now(datetime.timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")
+        # submitted_at has 1s resolution; tests that depend on FIFO order pass
+        # explicit, distinct stamps instead of sleeping between submissions.
+        submitted_at = submitted_at or datetime.datetime.now(
+            datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         reg = protocol.register(
             job_id=job_id, user=user, cmd=cmd, name=name, gpus_requested=gpus,
             mem_requested=mem_bytes, shareable=share, log_file=log_file,
-            submitted_at=submitted_at,
+            submitted_at=submitted_at, priority=priority, top=top,
         )
         conn = daemon.connect()
         protocol.send_msg(conn, reg)
@@ -182,16 +213,34 @@ def submit(daemon):
             os.setsid()
             args = type("A", (), {"name": name, "share": share})()
             cli._run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes,
-                            msgs=msgs)
+                            msgs=msgs, sock_path=daemon.socket_path)
             os._exit(0)
         forked.append(pid)
         conn.close()
         return ("queued", job_id, log_file)
 
+    _submit.waiter_pids = forked
     yield _submit
-    for pid in forked:
+    kill_waiters(forked)
+
+
+def kill_waiters(pids):
+    """SIGKILL waiter processes and whatever command each is running.
+
+    Waiters outlive the daemon by design (they keep trying to reattach), so
+    tests have to stop them explicitly. The command sits in its own process
+    group (the waiter starts it with start_new_session), hence killpg.
+    """
+    for pid in pids:
+        children = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True,
+                                  text=True).stdout.split()
+        for target, kill in [(pid, os.kill)] + [(int(c), os.killpg) for c in children]:
+            try:
+                kill(target, signal.SIGKILL)
+            except OSError:
+                pass
         try:
-            os.waitpid(pid, os.WNOHANG)
+            os.waitpid(pid, 0)
         except OSError:
             pass
 

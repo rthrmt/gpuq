@@ -3,6 +3,9 @@ socket_path = /run/gpuq/gpuq.sock
 db_path = /var/lib/gpuq/queue.db
 log_path = /var/log/gpuq/daemon.log
 poll_interval_seconds = 5
+# reattach_grace_seconds = 30 ; after a restart, how long to wait for the jobs
+                           ; found in the database to reattach before giving
+                           ; up on them (queued -> cancelled, running -> failed)
 # socket_mode = 0666       ; default 0666: open to all local users (no group needed).
                            ; To restrict access, set a tighter mode (e.g. 0660) and
                            ; manage socket ownership/group yourself.

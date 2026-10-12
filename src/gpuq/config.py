@@ -5,7 +5,7 @@ Override precedence (highest first):
     explicit CLI flag  >  environment variable  >  config file  >  built-in default
 
 The environment seams (``GPUQ_SOCKET``, ``GPUQ_DB``, ``GPUQ_LOG``, ``GPUQ_CONF``,
-``GPUQ_NVIDIA_SMI``) make it possible to run a daemon + client entirely in user
+``GPUQ_NVIDIA_SMI``, ``GPUQ_REATTACH_GRACE``) make it possible to run a daemon + client entirely in user
 space for development and tests, without touching ``/etc`` or ``/var`` and
 without root.
 """
@@ -23,6 +23,10 @@ DEFAULT_DB_PATH = "/var/lib/gpuq/queue.db"
 DEFAULT_LOG_PATH = "/var/log/gpuq/daemon.log"
 DEFAULT_POLL_INTERVAL = 5.0
 DEFAULT_IDLE_THRESHOLD_MB = 500
+# How long a freshly started daemon waits for the waiters of the jobs it finds
+# in the database to reattach before giving up on them. Waiters retry at most
+# every 5 seconds (cli.py), so this leaves a wide margin.
+DEFAULT_REATTACH_GRACE = 30.0
 # Open to all local users by default. gpuq is a single-node, trusted-box tool;
 # access is not gated behind a Unix group (see also the daemon's socket setup).
 DEFAULT_SOCKET_MODE = 0o666
@@ -40,6 +44,7 @@ class Config:
     idle_memory_threshold_bytes: int
     max_gpus_per_user: int                     # 0 => unlimited
     socket_mode: int                           # e.g. 0o666 (open to all local users)
+    reattach_grace_seconds: float = DEFAULT_REATTACH_GRACE
 
 
 def _conf_path(explicit: Optional[str]) -> Optional[str]:
@@ -113,6 +118,15 @@ def load_config(
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"invalid poll_interval_seconds {poll_raw!r}") from exc
 
+    grace_raw = pick(None, "GPUQ_REATTACH_GRACE", daemon, "reattach_grace_seconds",
+                     DEFAULT_REATTACH_GRACE)
+    try:
+        grace = float(grace_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"invalid reattach_grace_seconds {grace_raw!r}") from exc
+    if grace < 0:
+        raise ConfigError(f"invalid reattach_grace_seconds {grace_raw!r}: must be >= 0")
+
     managed: Optional[List[int]] = None
     if "managed_gpus" in gpus and gpus["managed_gpus"].strip():
         managed = _parse_gpu_list(gpus["managed_gpus"])
@@ -141,6 +155,7 @@ def load_config(
         idle_memory_threshold_bytes=idle_bytes,
         max_gpus_per_user=max_per_user,
         socket_mode=socket_mode,
+        reattach_grace_seconds=grace,
     )
 
 

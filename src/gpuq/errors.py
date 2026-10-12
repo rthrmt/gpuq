@@ -44,7 +44,7 @@ ERR_BAD_GPUS = "bad_gpus"
 ERR_TOO_MANY_GPUS = "too_many_gpus"
 # --mem exceeds the largest managed GPU; the job could never be placed.
 ERR_MEM_TOO_LARGE = "mem_too_large"
-# A cancel/cancel_all was refused (not the owner, or job already running).
+# A cancel/cancel_all/prioritize was refused (not the owner).
 ERR_PERMISSION = "permission_denied"
 # A referenced job id does not exist.
 ERR_NOT_FOUND = "not_found"
@@ -52,5 +52,12 @@ ERR_NOT_FOUND = "not_found"
 ERR_NOT_CANCELLABLE = "not_cancellable"
 # A running job was cancelled without force; the client must confirm first.
 ERR_CANCEL_REQUIRES_FORCE = "cancel_requires_force"
+# A priority was not an integer within +/- protocol.PRIORITY_LIMIT.
+ERR_BAD_PRIORITY = "bad_priority"
+# A job could not be reprioritized because it is no longer queued.
+ERR_NOT_QUEUED = "not_queued"
+# A reattach was refused: the job is not active any more, or already has a
+# waiter attached.
+ERR_NOT_REATTACHABLE = "not_reattachable"
 # Catch-all for malformed requests.
 ERR_BAD_REQUEST = "bad_request"

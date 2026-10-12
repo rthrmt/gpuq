@@ -6,10 +6,14 @@ Architecture (see CLAUDE.md for the full contract):
 * A **connection thread** for a ``register`` validates, inserts a queued row,
   records the connection in ``_pending``, signals the scheduler, then blocks
   reading for the ``done`` message (the socket stays open for the job's life).
-  Short queries (status/cancel/history) are answered and the socket closed.
+  Short queries (status/cancel/prioritize/history) are answered and the
+  socket closed.
 * A single **scheduler thread** waits on a condition (woken by register/done/
   cancel or the poll timer), refreshes live GPU state, and runs a scheduling
   pass. It sends ``go`` directly on the stored connection.
+* The job state that matters lives in the database and in the waiters, not in
+  this process: after a restart the waiters ``reattach`` and the daemon carries
+  on with the same queue and the same running jobs (see ``_reconcile_startup``).
 
 The daemon NEVER spawns or owns user processes; it only tells already-running
 waiter processes when and where to run.
@@ -22,10 +26,13 @@ scheduler.
 import datetime
 import logging
 import os
+import pwd
 import signal
 import socket
+import struct
 import sys
 import threading
+import time
 from typing import Dict, List, Optional
 
 from . import errors, protocol
@@ -33,13 +40,48 @@ from .config import Config, load_config
 from .db import Database, Job
 from .gpu import NvidiaSmiError, query_gpu_processes, query_gpus
 from .gpustate import GpuState
-from .scheduler import SchedJob, schedule_pass
+from .scheduler import SchedJob, queue_order, schedule_pass
 
 logger = logging.getLogger("gpuq.daemon")
 
 
 def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _valid_priority(value) -> bool:
+    # bool is an int subclass; a JSON `true` is not a priority.
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and abs(value) <= protocol.PRIORITY_LIMIT)
+
+
+def _peer_uid(conn: socket.socket) -> Optional[int]:
+    """UID of the process at the other end of ``conn``, as reported by the
+    kernel. ``None`` only where the platform has no ``SO_PEERCRED``."""
+    opt = getattr(socket, "SO_PEERCRED", None)
+    if opt is None:
+        return None
+    # struct ucred { pid_t pid; uid_t uid; gid_t gid; }
+    creds = conn.getsockopt(socket.SOL_SOCKET, opt, struct.calcsize("iII"))
+    return struct.unpack("iII", creds)[1]
+
+
+def effective_user(peer_uid: Optional[int], own_uid: int,
+                   claimed: Optional[str]) -> Optional[str]:
+    """Who a request really comes from.
+
+    The username inside a message is only a claim by the client. It is taken
+    at face value when the peer is root or runs as the daemon's own user (root
+    in production; the developer in user-space runs and the tests), or when
+    the platform cannot identify the peer. For everyone else the peer's uid
+    decides, whatever the message says.
+    """
+    if peer_uid is None or peer_uid == 0 or peer_uid == own_uid:
+        return claimed
+    try:
+        return pwd.getpwuid(peer_uid).pw_name
+    except KeyError:
+        return str(peer_uid)
 
 
 class _Pending:
@@ -67,6 +109,11 @@ class Daemon:
         # Jobs we asked a waiter to kill; their non-zero exit is a cancellation,
         # not a failure. Guarded by _state_lock.
         self._terminating: set = set()
+        # Jobs found in the database at startup whose waiter has not reattached
+        # yet. While any remain (and until _recovery_deadline) the queue is
+        # held. Guarded by _state_lock.
+        self._awaiting: set = set()
+        self._recovery_deadline = 0.0
         self._server: Optional[socket.socket] = None
         self._stop = threading.Event()
         self._scheduler_thread: Optional[threading.Thread] = None
@@ -131,6 +178,9 @@ class Daemon:
     def start(self) -> None:
         self._reconcile_startup()
         self._open_socket()
+        # The grace period starts once waiters can actually reach us.
+        self._recovery_deadline = (
+            time.monotonic() + self.config.reattach_grace_seconds)
         self._scheduler_thread = threading.Thread(
             target=self._scheduler_loop, name="scheduler", daemon=True
         )
@@ -141,19 +191,60 @@ class Daemon:
         self._accept_loop()
 
     def _reconcile_startup(self) -> None:
-        """Crash recovery: any DB 'running' job lost its waiter connection when
-        the daemon stopped, so we can no longer receive its 'done'. Mark such
-        jobs failed and free their GPUs (the underlying processes may keep
-        running until they exit on their own)."""
-        failed = self.db.fail_all_running(_now_iso())
-        if failed:
-            logger.warning(
-                "startup: marked %d in-flight job(s) failed (no reconnect "
-                "protocol; their processes may still be running): %s",
-                len(failed), ", ".join(s[:8] for s in failed),
-            )
+        """Pick up where the previous daemon left off.
+
+        Every job the database lists as queued or running had a waiter
+        attached to the previous daemon, and those waiters reconnect on their
+        own (``reattach``). So nothing is failed here: running jobs get their
+        GPU reservations back immediately -- their GPUs must not be handed out
+        in the meantime -- and every active job is expected to reattach within
+        ``reattach_grace_seconds`` (see ``_give_up_on_missing_locked``).
+        """
         with self._state_lock:
             self.state.clear()
+            for job in self.db.active_jobs():
+                self._awaiting.add(job.job_id)
+                if job.status == "running":
+                    self._restore_reservation_locked(job)
+            if self._awaiting:
+                logger.info(
+                    "startup: %d active job(s) in the database; waiting up to "
+                    "%.0fs for their waiters to reattach",
+                    len(self._awaiting), self.config.reattach_grace_seconds)
+
+    def _restore_reservation_locked(self, job: Job) -> None:
+        managed = set(self.state.managed_indices)
+        for idx in job.gpu_ids or []:
+            if idx in managed:
+                self.state.reserve(idx, job.job_id, job.mem_requested or 0,
+                                   job.shareable)
+            else:
+                logger.warning("job %s runs on GPU %d, which is no longer managed",
+                               job.job_id[:8], idx)
+
+    def _give_up_on_missing_locked(self) -> None:
+        """The grace period is over: finalise the jobs whose waiter never came
+        back (it died while the daemon was down, or it predates reattach).
+        Caller holds _state_lock."""
+        cancelled, failed = [], []
+        for job_id in sorted(self._awaiting):
+            job = self.db.get_job(job_id)
+            if job is None:
+                continue
+            if job.status == "queued":
+                self.db.mark_cancelled(job_id, _now_iso())
+                cancelled.append(job_id)
+            elif job.status == "running":
+                # Its process may still be running; we just cannot know.
+                self.db.mark_failed(job_id, _now_iso())
+                self.state.release_job(job_id)
+                failed.append(job_id)
+        self._awaiting.clear()
+        logger.warning(
+            "startup: %d job(s) did not reattach within %.0fs: cancelled "
+            "queued [%s], marked running failed [%s]",
+            len(cancelled) + len(failed), self.config.reattach_grace_seconds,
+            ", ".join(j[:8] for j in cancelled), ", ".join(j[:8] for j in failed))
 
     def _open_socket(self) -> None:
         path = self.config.socket_path
@@ -218,13 +309,19 @@ class Daemon:
 
     def _handle_conn(self, conn: socket.socket) -> None:
         try:
-            msg = protocol.recv_one(conn)
+            # One iterator for the whole connection: a waiter's connection is
+            # read again later (for 'done'), and a second iterator would drop
+            # whatever this one had already buffered (see protocol.recv_one).
+            msgs = protocol.iter_msgs(conn)
+            msg = next(msgs, None)
             if msg is None:
                 conn.close()
                 return
             mtype = protocol.get_type(msg)
             if mtype == protocol.REGISTER:
-                self._handle_register(conn, msg)   # owns conn lifetime
+                self._handle_register(conn, msg, msgs)   # owns conn lifetime
+            elif mtype == protocol.REATTACH:
+                self._handle_reattach(conn, msg, msgs)   # owns conn lifetime
             elif mtype == protocol.STATUS:
                 self._reply_status(conn)
                 conn.close()
@@ -239,6 +336,9 @@ class Daemon:
                 conn.close()
             elif mtype == protocol.CANCEL_ALL:
                 self._reply_cancel_all(conn, msg)
+                conn.close()
+            elif mtype == protocol.PRIORITIZE:
+                self._reply_prioritize(conn, msg)
                 conn.close()
             else:
                 protocol.send_msg(conn, protocol.error(
@@ -257,6 +357,12 @@ class Daemon:
             except OSError:
                 pass
 
+    # --- identity ---------------------------------------------------------
+
+    def _requester(self, conn: socket.socket, claimed: Optional[str]) -> Optional[str]:
+        """The user a request on ``conn`` is acting as (see effective_user)."""
+        return effective_user(_peer_uid(conn), os.getuid(), claimed)
+
     # --- register / job lifecycle -----------------------------------------
 
     def _validate_register(self, msg) -> None:
@@ -268,6 +374,11 @@ class Daemon:
         if shareable and mem is None:
             raise errors.ValidationError(
                 errors.ERR_SHARE_REQUIRES_MEM, "--share requires --mem (e.g. --mem 8G)")
+        if not _valid_priority(msg.get("priority", 0)):
+            raise errors.ValidationError(
+                errors.ERR_BAD_PRIORITY,
+                f"--priority must be an integer between -{protocol.PRIORITY_LIMIT} "
+                f"and {protocol.PRIORITY_LIMIT}")
         with self._state_lock:
             # Refresh live GPU data so largest_gpu_memory() reflects reality
             # even before the first scheduler poll.
@@ -287,7 +398,14 @@ class Daemon:
                 errors.ERR_MEM_TOO_LARGE,
                 f"--mem exceeds the largest managed GPU ({format_size(largest)})")
 
-    def _handle_register(self, conn: socket.socket, msg) -> None:
+    def _handle_register(self, conn: socket.socket, msg, msgs) -> None:
+        actual = self._requester(conn, msg.get("user"))
+        if actual != msg.get("user"):
+            protocol.send_msg(conn, protocol.error(
+                errors.ERR_PERMISSION,
+                f"cannot submit as {msg.get('user')!r}: you are {actual!r}"))
+            conn.close()
+            return
         try:
             self._validate_register(msg)
         except errors.ValidationError as exc:
@@ -295,6 +413,10 @@ class Daemon:
             conn.close()
             return
 
+        priority = msg.get("priority", 0)
+        if msg.get("top"):
+            highest = self.db.max_queued_priority(msg["user"])
+            priority = 0 if highest is None else self._priority_above(highest)
         job = Job(
             job_id=msg["job_id"], user=msg["user"], name=msg.get("name"),
             cmd=msg["cmd"], gpus_requested=msg.get("gpus_requested", 1),
@@ -303,36 +425,121 @@ class Daemon:
             status="queued", log_file=msg["log_file"],
             submitted_at=msg.get("submitted_at") or _now_iso(),
             started_at=None, finished_at=None, exit_code=None,
+            priority=priority,
         )
         self.db.insert_queued(
             job_id=job.job_id, user=job.user, name=job.name, cmd=job.cmd,
             gpus_requested=job.gpus_requested, mem_requested=job.mem_requested,
             shareable=job.shareable, log_file=job.log_file,
-            submitted_at=job.submitted_at,
+            submitted_at=job.submitted_at, priority=job.priority,
         )
         position = self._queue_position(job.job_id)
         pending = _Pending(job, conn)
         with self._state_lock:
             self._pending[job.job_id] = pending
         try:
-            pending.send(protocol.queued(position))
+            pending.send(protocol.queued(position, job.priority))
         except OSError:
             self._on_waiter_lost(job.job_id, still_queued=True)
             conn.close()
             return
 
         self._signal_scheduler()
+        self._serve_waiter(job.job_id, conn, msgs)
 
-        # Block reading on this connection until the waiter reports done or the
-        # connection drops (EOF). The scheduler thread sends 'go' meanwhile.
+    def _serve_waiter(self, job_id: str, conn: socket.socket, msgs) -> None:
+        """Block reading an attached waiter's connection until it reports done
+        or the connection drops (EOF). The scheduler thread sends 'go'
+        meanwhile."""
         try:
-            done = protocol.recv_one(conn)
+            done = next(msgs, None)
         except errors.ProtocolError:
             done = None
         if done is not None and protocol.get_type(done) == protocol.DONE:
-            self._on_done(job.job_id, int(done.get("exit_code", 1)))
+            with self._state_lock:
+                pending = self._pending.get(job_id)
+            self._on_done(job_id, int(done.get("exit_code", 1)))
+            # Without the ack a waiter cannot tell a recorded exit code from
+            # one that was lost because the daemon went down just then.
+            if pending is not None:
+                try:
+                    pending.send(protocol.done_ack())
+                except OSError:
+                    pass
         else:
-            self._on_waiter_lost(job.job_id, still_queued=None)
+            self._on_waiter_lost(job_id, still_queued=None)
+        conn.close()
+
+    def _handle_reattach(self, conn: socket.socket, msg, msgs) -> None:
+        """A waiter lost its connection (this daemon is a restarted one) and
+        asks to have its job tracked again."""
+        job_id = msg.get("job_id")
+        state = msg.get("state")
+        job = self.db.get_job(job_id)
+
+        def refuse(code: str, message: str) -> None:
+            protocol.send_msg(conn, protocol.error(code, message))
+            conn.close()
+
+        if job is None:
+            return refuse(errors.ERR_NOT_FOUND, "no such job")
+        if self._requester(conn, job.user) != job.user:
+            return refuse(errors.ERR_PERMISSION, "you may only reattach your own jobs")
+        if state == protocol.STATE_FINISHED:
+            return self._reattach_finished(conn, job_id, msg.get("exit_code"))
+        if state not in (protocol.STATE_QUEUED, protocol.STATE_RUNNING):
+            return refuse(errors.ERR_BAD_REQUEST, f"unknown job state: {state!r}")
+
+        problem = None
+        with self._state_lock:
+            # Re-read under the lock: the end of the grace period finalises
+            # jobs under this lock too, and must not race with adopting one.
+            job = self.db.get_job(job_id)
+            if job_id in self._pending:
+                problem = "job already has a waiter attached"
+            elif job.status not in ("queued", "running") or (
+                    state == protocol.STATE_RUNNING and job.status != "running"):
+                problem = f"job is {job.status}"
+            else:
+                pending = _Pending(job, conn)
+                self._pending[job_id] = pending
+                self._awaiting.discard(job_id)
+                # Acknowledge before releasing the lock, so the scheduler
+                # cannot get a 'go' onto this connection ahead of the ack.
+                try:
+                    pending.send(protocol.reattached())
+                    if state == protocol.STATE_QUEUED and job.status == "running":
+                        # The previous daemon recorded the placement but went
+                        # down before its 'go' reached the waiter. The GPUs
+                        # are still reserved for this job, so just say it again.
+                        pending.send(protocol.go(job.gpu_ids or []))
+                except OSError:
+                    pass   # the read below sees the dead connection
+        if problem is not None:
+            return refuse(errors.ERR_NOT_REATTACHABLE, problem)
+        logger.info("job %s: waiter reattached (%s)", job_id[:8], job.status)
+        self._signal_scheduler()
+        self._serve_waiter(job_id, conn, msgs)
+
+    def _reattach_finished(self, conn: socket.socket, job_id: str, exit_code) -> None:
+        """The command ended while no daemon was there to hear about it."""
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            exit_code = 1
+        with self._state_lock:
+            job = self.db.get_job(job_id)
+            attached = job_id in self._pending
+            record = job.status == "running" and not attached
+            if record:
+                self._awaiting.discard(job_id)
+        if record:
+            self._on_done(job_id, exit_code)
+        if attached or job.status == "queued":
+            protocol.send_msg(conn, protocol.error(
+                errors.ERR_NOT_REATTACHABLE, f"job is {job.status}"))
+        else:
+            # Also acknowledged when the job is already finished: the waiter
+            # may be repeating a report whose ack it never saw.
+            protocol.send_msg(conn, protocol.reattached())
         conn.close()
 
     def _on_done(self, job_id: str, exit_code: int) -> None:
@@ -387,7 +594,7 @@ class Daemon:
     def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
             with self._wake:
-                self._wake.wait(timeout=self.config.poll_interval_seconds)
+                self._wake.wait(timeout=self._wait_timeout_locked())
                 if self._stop.is_set():
                     break
                 placement_events = self._run_schedule_pass_locked()
@@ -406,17 +613,30 @@ class Daemon:
                     daemon=True,
                 ).start()
 
+    def _wait_timeout_locked(self) -> float:
+        timeout = self.config.poll_interval_seconds
+        if self._awaiting:
+            # Wake up when the grace period ends rather than a poll later.
+            timeout = min(timeout, max(0.05, self._recovery_deadline - time.monotonic()))
+        return timeout
+
     def _run_schedule_pass_locked(self) -> list:
         """Run one scheduling pass. Caller holds _state_lock (via _wake).
         Returns pending placement-event dicts (memory/utilization already
         captured; process lists not yet fetched) for the caller to finish
         and persist after releasing the lock."""
+        if self._awaiting:
+            if time.monotonic() < self._recovery_deadline:
+                # Hold the queue: placing a job now could overtake older jobs
+                # whose waiters are about to reattach.
+                return []
+            self._give_up_on_missing_locked()
         self._refresh_live()
         queued_rows = self.db.queued_jobs_ordered()
         # Only consider jobs whose waiter is still connected.
         candidates = [
             SchedJob(j.job_id, j.user, j.gpus_requested, j.mem_requested,
-                     j.shareable, j.submitted_at)
+                     j.shareable, j.submitted_at, j.priority)
             for j in queued_rows if j.job_id in self._pending
         ]
         if not candidates:
@@ -469,10 +689,14 @@ class Daemon:
         return self.state.gpus_held_by_user_jobs(by_user)
 
     def _queue_position(self, job_id: str) -> int:
-        for i, j in enumerate(self.db.queued_jobs_ordered(), start=1):
+        for i, j in enumerate(queue_order(self.db.queued_jobs_ordered()), start=1):
             if j.job_id == job_id:
                 return i
         return 0
+
+    @staticmethod
+    def _priority_above(highest: int) -> int:
+        return min(highest + 1, protocol.PRIORITY_LIMIT)
 
     # --- queries ----------------------------------------------------------
 
@@ -485,6 +709,7 @@ class Daemon:
             "mem_requested": job.mem_requested,
             "mem_requested_human": format_size(job.mem_requested) if job.mem_requested else None,
             "shareable": job.shareable, "queue_position": queue_position,
+            "priority": job.priority,
             "submitted_at": job.submitted_at, "started_at": job.started_at,
             "finished_at": job.finished_at, "exit_code": job.exit_code,
             "log_file": job.log_file,
@@ -492,13 +717,12 @@ class Daemon:
 
     def _reply_status(self, conn: socket.socket) -> None:
         active = self.db.active_jobs()
-        queue_pos = {}
-        pos = 0
-        for j in active:
-            if j.status == "queued":
-                pos += 1
-                queue_pos[j.job_id] = pos
-        jobs = [self._job_to_dict(j, queue_pos.get(j.job_id)) for j in active]
+        running = [j for j in active if j.status != "queued"]
+        # Listed in queue order, so priorities show up as the order of the rows.
+        queued = queue_order([j for j in active if j.status == "queued"])
+        queue_pos = {j.job_id: i for i, j in enumerate(queued, start=1)}
+        jobs = [self._job_to_dict(j, queue_pos.get(j.job_id))
+                for j in running + queued]
         protocol.send_msg(conn, protocol.status_response(jobs))
 
     def _reply_history(self, conn: socket.socket, msg) -> None:
@@ -526,7 +750,7 @@ class Daemon:
 
     def _reply_cancel(self, conn: socket.socket, msg) -> None:
         job_id = msg.get("job_id")
-        requester = msg.get("requesting_user")
+        requester = self._requester(conn, msg.get("requesting_user"))
         job = self.db.get_job(job_id)
         if job is None:
             protocol.send_msg(conn, protocol.error(errors.ERR_NOT_FOUND, "no such job"))
@@ -557,13 +781,57 @@ class Daemon:
             f"job is {job.status}; only queued or running jobs can be cancelled"))
 
     def _reply_cancel_all(self, conn: socket.socket, msg) -> None:
-        requester = msg.get("requesting_user")
+        requester = self._requester(conn, msg.get("requesting_user"))
         count = 0
         for j in self.db.queued_jobs_ordered():
             if requester == "root" or j.user == requester:
                 self._cancel_queued_job(j.job_id)
                 count += 1
         protocol.send_msg(conn, protocol.cancel_all_response(count))
+
+    def _reply_prioritize(self, conn: socket.socket, msg) -> None:
+        requester = self._requester(conn, msg.get("requesting_user"))
+        job = self.db.get_job(msg.get("job_id"))
+        if job is None:
+            protocol.send_msg(conn, protocol.error(errors.ERR_NOT_FOUND, "no such job"))
+            return
+        if requester != "root" and job.user != requester:
+            protocol.send_msg(conn, protocol.error(
+                errors.ERR_PERMISSION, "you may only reprioritize your own jobs"))
+            return
+        if job.status != "queued":
+            protocol.send_msg(conn, protocol.error(
+                errors.ERR_NOT_QUEUED,
+                f"job is {job.status}; only queued jobs can be reprioritized"))
+            return
+        if msg.get("top"):
+            # Just above the owner's other queued jobs; a job already ahead of
+            # them keeps its priority, so repeating the request is a no-op.
+            others = self.db.max_queued_priority(job.user, exclude_job_id=job.job_id)
+            if others is None or job.priority > others:
+                priority = job.priority
+            else:
+                priority = self._priority_above(others)
+        else:
+            priority = msg.get("priority")
+            if not _valid_priority(priority):
+                protocol.send_msg(conn, protocol.error(
+                    errors.ERR_BAD_PRIORITY,
+                    f"priority must be an integer between -{protocol.PRIORITY_LIMIT} "
+                    f"and {protocol.PRIORITY_LIMIT}"))
+                return
+        if not self.db.set_priority(job.job_id, priority):
+            # The scheduler started it (or it was cancelled) since we looked.
+            protocol.send_msg(conn, protocol.error(
+                errors.ERR_NOT_QUEUED, "job is no longer queued"))
+            return
+        if priority != job.priority:
+            logger.info("job %s: priority %d -> %d (by %s)", job.job_id[:8],
+                        job.priority, priority, requester)
+        # No scheduler wake-up: a pass already places everything that fits, so
+        # reordering the queue cannot make a waiting job placeable.
+        protocol.send_msg(conn, protocol.prioritize_response(
+            priority, job.priority, self._queue_position(job.job_id), job.name))
 
     def _terminate_running_job(self, job_id: str) -> bool:
         """Ask a running job's waiter to kill its command's process group.
@@ -592,6 +860,7 @@ class Daemon:
         self.db.mark_cancelled(job_id, _now_iso())
         with self._state_lock:
             pending = self._pending.pop(job_id, None)
+            self._awaiting.discard(job_id)
         if pending is not None:
             # Tell the waiter to give up, then drop the connection.
             try:
@@ -611,6 +880,40 @@ def _setup_logging(config: Config) -> None:
     )
 
 
+def restart_check(socket_path: str) -> int:
+    """`gpuqd --restart-check`: would restarting the *running* daemon lose jobs?
+
+    Returns 0 if a restart is safe, 1 if it would lose jobs, 2 if no daemon
+    answers. Jobs survive a restart when their waiters can reattach, which is
+    the case exactly when the running daemon speaks protocol version 2 or
+    later: a waiter is never older than the daemon it is attached to, because
+    until version 2 no waiter outlived a daemon.
+    """
+    try:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.connect(socket_path)
+        protocol.send_msg(conn, protocol.status())
+        reply = protocol.recv_one(conn)
+        conn.close()
+    except OSError as exc:
+        print(f"gpuqd is not reachable at {socket_path}: {exc}")
+        return 2
+    if reply is None:
+        print(f"gpuqd at {socket_path} did not answer")
+        return 2
+    active = len(reply.get("jobs", []))
+    if reply.get("protocol_version", 1) >= 2:
+        print(f"{active} active job(s); they will reattach to the restarted gpuqd")
+        return 0
+    if not active:
+        print("no active jobs")
+        return 0
+    print(f"{active} active job(s) would be lost: the running gpuqd predates "
+          f"restart-safe queues (queued jobs are dropped, running jobs keep "
+          f"running but are no longer tracked)")
+    return 1
+
+
 def main(argv=None) -> int:
     import argparse
 
@@ -618,9 +921,15 @@ def main(argv=None) -> int:
     parser.add_argument("--config", help="path to gpuq.conf")
     parser.add_argument("--socket", help="override socket path")
     parser.add_argument("--db", help="override database path")
+    parser.add_argument(
+        "--restart-check", action="store_true",
+        help="report whether restarting the running gpuqd would lose jobs, "
+             "then exit (0 = safe, 1 = jobs would be lost, 2 = not running)")
     args = parser.parse_args(argv)
 
     config = load_config(conf_path=args.config, socket_path=args.socket, db_path=args.db)
+    if args.restart_check:
+        return restart_check(config.socket_path)
     _setup_logging(config)
     daemon = Daemon(config)
     try:

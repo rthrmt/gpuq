@@ -4,7 +4,8 @@ import pytest
 
 from gpuq.gpu import GpuInfo
 from gpuq.gpustate import GpuState
-from gpuq.scheduler import SchedJob, fair_order, schedule_pass, try_place
+from gpuq.scheduler import (SchedJob, fair_order, queue_order, schedule_pass,
+                            try_place)
 
 GB = 1024 ** 3
 
@@ -20,8 +21,9 @@ def make_state(gpus, idle_threshold=500 * 1024 * 1024):
     return state
 
 
-def job(jid, user="alice", gpus=1, mem=None, share=False, ts="2026-01-01T00:00:00Z"):
-    return SchedJob(jid, user, gpus, mem * GB if mem else None, share, ts)
+def job(jid, user="alice", gpus=1, mem=None, share=False, ts="2026-01-01T00:00:00Z",
+        prio=0):
+    return SchedJob(jid, user, gpus, mem * GB if mem else None, share, ts, prio)
 
 
 # --- fair_order ------------------------------------------------------------
@@ -39,6 +41,91 @@ def test_fair_order_fifo_tiebreak():
     ]
     order = fair_order(jobs, {})
     assert [j.job_id for j in order] == ["early", "late"]
+
+
+# --- priority: reorders a user's own jobs only -----------------------------
+
+def _ids(jobs):
+    return [j.job_id for j in jobs]
+
+
+def test_priority_moves_job_ahead_of_own_older_jobs():
+    jobs = [job("a1", ts="t1"), job("a2", ts="t2"), job("a3", ts="t3", prio=5)]
+    assert _ids(fair_order(jobs, {})) == ["a3", "a1", "a2"]
+
+
+def test_equal_priorities_are_plain_fifo():
+    jobs = [job("a2", "alice", ts="t2", prio=3), job("b1", "bob", ts="t3", prio=3),
+            job("a1", "alice", ts="t1", prio=3)]
+    assert _ids(fair_order(jobs, {})) == ["a1", "a2", "b1"]
+
+
+def test_priority_cannot_jump_another_users_job():
+    # Bob submitted later; no priority he sets may put him ahead of Alice.
+    jobs = [job("a1", "alice", ts="t1"), job("b1", "bob", ts="t2", prio=1000)]
+    assert _ids(fair_order(jobs, {})) == ["a1", "b1"]
+
+
+def test_priority_swaps_only_within_the_owners_slots():
+    # Queue slots by submission: alice, bob, alice, bob. Bob promotes his
+    # later job: his two jobs trade places, Alice's positions are unchanged.
+    jobs = [job("a1", "alice", ts="t1"), job("b1", "bob", ts="t2"),
+            job("a2", "alice", ts="t3"), job("b2", "bob", ts="t4", prio=1)]
+    assert _ids(fair_order(jobs, {})) == ["a1", "b2", "a2", "b1"]
+
+
+def test_priority_respected_when_submitted_in_the_same_second():
+    # submitted_at has 1s resolution, so the job_id tie-break must not be able
+    # to put a lower-priority job first.
+    jobs = [job("a", ts="t1"), job("b", ts="t1"), job("z", ts="t1", prio=1)]
+    assert _ids(fair_order(jobs, {}))[0] == "z"
+
+
+def test_negative_priority_goes_to_the_back_of_own_queue():
+    jobs = [job("a1", ts="t1", prio=-1), job("a2", ts="t2"), job("a3", ts="t3")]
+    assert _ids(fair_order(jobs, {})) == ["a2", "a3", "a1"]
+
+
+def test_fairness_still_outranks_priority():
+    # Alice already has a job running; her high priority does not beat Bob.
+    jobs = [job("a1", "alice", ts="t1", prio=99), job("b1", "bob", ts="t2")]
+    assert _ids(fair_order(jobs, {"alice": 1})) == ["b1", "a1"]
+
+
+def test_queue_order_ignores_running_counts():
+    jobs = [job("a1", "alice", ts="t1"), job("b1", "bob", ts="t2"),
+            job("a2", "alice", ts="t3", prio=1)]
+    assert _ids(queue_order(jobs)) == ["a2", "b1", "a1"]
+
+
+def test_schedule_pass_places_high_priority_job_first():
+    state = make_state([(0, 24, 0)])
+    placed = []
+
+    def commit(j, ids):
+        placed.append(j.job_id)
+        for i in ids:
+            state.reserve(i, j.job_id, 0, False)
+
+    jobs = [job("a1", ts="t1"), job("a2", ts="t2"), job("a3", ts="t3", prio=1)]
+    assert schedule_pass(jobs, state, {}, commit=commit) == 1
+    assert placed == ["a3"]
+
+
+def test_unplaceable_high_priority_job_does_not_block_own_jobs():
+    # Skip-don't-block still applies: the promoted 2-GPU job cannot fit on the
+    # single GPU, so the owner's ordinary job runs instead.
+    state = make_state([(0, 24, 0)])
+    placed = []
+
+    def commit(j, ids):
+        placed.append(j.job_id)
+        for i in ids:
+            state.reserve(i, j.job_id, 0, False)
+
+    jobs = [job("small", ts="t1"), job("big", ts="t2", gpus=2, prio=5)]
+    assert schedule_pass(jobs, state, {}, commit=commit) == 1
+    assert placed == ["small"]
 
 
 # --- try_place: exclusive --------------------------------------------------

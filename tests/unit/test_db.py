@@ -18,6 +18,7 @@ def _add(db, job_id, user="alice", ts="2026-01-01T00:00:00Z", **kw):
         cmd=kw.get("cmd", "echo hi"), gpus_requested=kw.get("gpus", 1),
         mem_requested=kw.get("mem"), shareable=kw.get("share", False),
         log_file=kw.get("log", "/tmp/x.log"), submitted_at=ts,
+        priority=kw.get("priority", 0),
     )
 
 
@@ -67,16 +68,6 @@ def test_running_counts_by_user(db):
     assert counts == {"alice": 1, "bob": 1}
 
 
-def test_fail_all_running_crash_recovery(db):
-    _add(db, "r1")
-    _add(db, "q1")
-    db.mark_running("r1", [0], "t")
-    failed = db.fail_all_running("2026-01-01T00:05:00Z")
-    assert failed == ["r1"]
-    assert db.get_job("r1").status == FAILED
-    assert db.get_job("q1").status == "queued"  # queued untouched
-
-
 def test_history_filters_and_limits(db):
     for i in range(5):
         _add(db, f"d{i}", ts=f"2026-01-01T00:00:0{i}Z")
@@ -92,6 +83,80 @@ def test_find_by_prefix(db):
     _add(db, "abcd1234")
     matches = db.find_by_prefix("abcd")
     assert len(matches) == 1 and matches[0].job_id == "abcd1234"
+
+
+# --- priority ---------------------------------------------------------------
+
+def test_priority_defaults_to_zero_and_round_trips(db):
+    _add(db, "plain")
+    _add(db, "urgent", priority=7)
+    assert db.get_job("plain").priority == 0
+    assert db.get_job("urgent").priority == 7
+
+
+def test_set_priority_on_queued_job(db):
+    _add(db, "j1")
+    assert db.set_priority("j1", -3) is True
+    assert db.get_job("j1").priority == -3
+
+
+def test_set_priority_refuses_non_queued_jobs(db):
+    _add(db, "run")
+    _add(db, "fin")
+    db.mark_running("run", [0], "t")
+    db.mark_done("fin", 0, "t")
+    assert db.set_priority("run", 5) is False
+    assert db.set_priority("fin", 5) is False
+    assert db.set_priority("missing", 5) is False
+    assert db.get_job("run").priority == 0
+
+
+def test_max_queued_priority_is_per_user_and_queued_only(db):
+    _add(db, "a1", "alice", priority=2)
+    _add(db, "a2", "alice", priority=9)
+    _add(db, "a3", "alice", priority=50)
+    _add(db, "b1", "bob", priority=100)
+    db.mark_running("a3", [0], "t")          # no longer queued -> ignored
+    assert db.max_queued_priority("alice") == 9
+    assert db.max_queued_priority("alice", exclude_job_id="a2") == 2
+    assert db.max_queued_priority("carol") is None
+
+
+def test_database_from_before_priorities_is_migrated(tmp_path):
+    """Upgrading gpuq must not need a fresh database: opening one created by a
+    version without the priority column adds it and keeps the existing rows."""
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY, user TEXT NOT NULL, name TEXT,
+            cmd TEXT NOT NULL, gpus_requested INTEGER NOT NULL DEFAULT 1,
+            mem_requested INTEGER, shareable INTEGER NOT NULL DEFAULT 0,
+            gpu_ids TEXT, status TEXT NOT NULL, log_file TEXT NOT NULL,
+            submitted_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            exit_code INTEGER
+        );
+        INSERT INTO jobs (job_id, user, cmd, status, log_file, submitted_at)
+        VALUES ('old1', 'alice', 'echo hi', 'queued', '/tmp/o.log', 't');
+    """)
+    conn.commit()
+    conn.close()
+
+    d = Database(path)
+    try:
+        assert d.get_job("old1").priority == 0
+        assert d.set_priority("old1", 4) is True
+        _add(d, "new1", priority=1)
+        assert d.max_queued_priority("alice") == 4
+    finally:
+        d.close()
+    # Re-opening an already migrated database is a no-op.
+    d = Database(path)
+    try:
+        assert d.get_job("old1").priority == 4
+    finally:
+        d.close()
 
 
 # --- placement_events -------------------------------------------------------

@@ -18,6 +18,7 @@ gpuq status        # the queue (everyone's jobs)
 gpuq mine          # just your jobs, with a summary
 gpuq logs <id> -f  # follow output (Ctrl-C to stop)
 gpuq cancel <id>   # drop a queued job, or kill a running one (asks first)
+gpuq priority <id> --top   # run this queued job before your other queued jobs
 gpuq history       # recently finished jobs
 ```
 
@@ -53,7 +54,7 @@ all set. (If `python3` isn't your interpreter, swap in the right path — see
 ### `submit` — queue a job
 
 ```
-gpuq submit "<command>" [--name NAME] [--gpus N] [--mem SIZE] [--share]
+gpuq submit "<command>" [--name NAME] [--gpus N] [--mem SIZE] [--share] [--priority N | --top]
 ```
 
 Your shell returns immediately. A background process holds your place in line
@@ -65,6 +66,8 @@ and runs the command when gpuq grants a GPU.
 | `--gpus N` | `1` | GPUs required — **all N at once or none** |
 | `--mem SIZE` | none | Per-GPU memory, e.g. `8G`, `512M`, `1.5G` (unit required) |
 | `--share` | off | Allow co-locating with other `--share` jobs (requires `--mem`) |
+| `--priority N` | `0` | Order among **your own** queued jobs; higher runs first |
+| `--top` | off | Queue ahead of all your other queued jobs |
 
 ```bash
 gpuq submit "python train.py --lr 0.001" --name baseline
@@ -84,10 +87,13 @@ gpuq mine          # your jobs only, plus "N running, M queued"
 ```
 
 ```
-ID      USER     STATUS    POS  GPU  SUBMITTED         STARTED           NAME/CMD
-7a3f    alice    queued    1    -    2026-05-16 14:30  -                 baseline
-3b1c    bob      running   -    0    2026-05-16 14:15  2026-05-16 14:20  finetune
+ID      USER     STATUS    POS  PRIO  GPU  SUBMITTED         STARTED           NAME/CMD
+3b1c    bob      running   -    -     0    2026-05-16 14:15  2026-05-16 14:20  finetune
+7a3f    alice    queued    1    -     -    2026-05-16 14:30  -                 baseline
 ```
+
+Queued jobs are listed in queue order (`POS`). `PRIO` shows a queued job's
+priority when it isn't the default `0`.
 
 ### `logs` — view output
 
@@ -128,6 +134,28 @@ In a script (no terminal to prompt on), pass `--force`:
 gpuq cancel 7a3f --force
 ```
 
+### `priority` — run one of your queued jobs sooner (or later)
+
+Just submitted something more important than what you already have waiting?
+Move it to the front of **your** queue — nothing gets cancelled:
+
+```bash
+gpuq priority 7a3f --top   # ahead of all your other queued jobs
+gpuq priority 7a3f 5       # or set a number: higher runs first, default is 0
+gpuq priority 7a3f -1      # send it behind your other jobs
+```
+
+Or do it in one go when submitting:
+
+```bash
+gpuq submit "python urgent.py" --name urgent --top
+```
+
+This only reorders **your own** jobs: the promoted job takes the place in line
+that your oldest queued job had, and the rest of yours shift back. It never
+puts you ahead of anyone else, and it only works on jobs that are still queued.
+(`gpuq prio` is a shorter alias.)
+
 ### `history` — recently finished
 
 ```bash
@@ -165,12 +193,15 @@ gpuq submit "~/myproject/.venv/bin/python train.py" --name baseline
 
 - **Fairness:** when a GPU frees up, the user with the fewest currently-running
   jobs goes first; ties broken oldest-first. No one can hog every GPU.
+- **Priority:** only decides which of *your own* queued jobs goes next; it
+  can't be used to jump ahead of other users.
 - **Best-fit:** gpuq picks the smallest GPU(s) that fit, keeping big cards free
   for jobs that need them.
 - **Skip, don't block:** if the next-in-line job can't fit right now (e.g. it
   needs 2 GPUs but only 1 is free), gpuq runs a smaller job that fits instead.
   A large/exclusive job can therefore wait a while behind a stream of small
-  ones — there's no priority bump in v1.
+  ones — including your own lower-priority ones; a priority orders your jobs,
+  it doesn't hold a GPU back for the big one.
 - **Exclusive vs shared:** by default a job owns its GPU(s) entirely. Add
   `--share --mem SIZE` to let gpuq pack your job onto a GPU alongside other
   `--share` jobs when the memory fits.
@@ -185,9 +216,12 @@ gpuq submit "~/myproject/.venv/bin/python train.py" --name baseline
   default exclusive mode.
 - **`--gpus N` is all-or-nothing** — a 2-GPU job waits until 2 GPUs are free
   together.
-- **If the daemon restarts while your job is running**, gpuq marks it `failed`
-  and stops tracking it (your process may keep running and logging on its own,
-  but its GPU slot won't be auto-freed). Re-check with `gpuq status`.
+- **Daemon restarts and upgrades don't lose your jobs.** Queued jobs keep
+  their place and running jobs stay tracked; a job that finishes while the
+  daemon is down reports its result when it comes back. This relies on the
+  small background process `gpuq submit` leaves behind for each job — don't
+  kill it. If it does die, a queued job is `cancelled` and a running one is
+  marked `failed` (its process may keep going, but gpuq no longer tracks it).
 
 ---
 

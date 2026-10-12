@@ -8,6 +8,12 @@ from the terminal) and return the shell to the user. The waiter then blocks for
 ``go``, redirects output to the log file, ``exec``s the command as the user, and
 finally reports ``done``.
 
+The waiter outlives the daemon it registered with. If the connection drops
+without an explicit answer (the daemon was restarted or upgraded) it reconnects
+and ``reattach``es, reporting where its job stands, so a restart neither loses
+the job's place in the queue nor the exit code of a running command (see
+:class:`_DaemonLink`).
+
 The daemon never spawns the user's process — the waiter is forked from the
 user's own shell, so it already runs as the right user.
 """
@@ -27,7 +33,7 @@ from typing import List, Optional
 
 from . import protocol
 from .config import client_socket_path
-from .errors import ProtocolError
+from .errors import ERR_BAD_REQUEST, ProtocolError
 from .logfile import compute_log_path, ensure_logs_dir, write_header
 from .sizeutil import format_size, parse_size
 
@@ -52,6 +58,10 @@ def _current_user() -> str:
 
 def _short(job_id: str) -> str:
     return job_id[:4]
+
+
+_OLD_DAEMON_HINT = ("the running gpuqd predates job priorities "
+                    "(an admin needs to restart it: sudo systemctl restart gpuq)")
 
 
 # --- submit ----------------------------------------------------------------
@@ -79,6 +89,7 @@ def cmd_submit(args, sock_path: str) -> int:
         job_id=job_id, user=user, cmd=cmd, name=args.name,
         gpus_requested=args.gpus, mem_requested=mem_bytes,
         shareable=bool(args.share), log_file=log_file, submitted_at=submitted_at,
+        priority=args.priority, top=bool(args.top),
     )
 
     # --- pre-fork handshake: connect & confirm acceptance synchronously ----
@@ -111,9 +122,15 @@ def cmd_submit(args, sock_path: str) -> int:
         extra.append(format_size(mem_bytes))
     if args.share:
         extra.append("shared")
+    if reply.get("priority"):
+        extra.append(f"priority {reply['priority']}")
     if extra:
         print("  " + ", ".join(extra))
     print(f"Logs: {log_file}")
+    if "priority" not in reply and (args.priority or args.top):
+        # A gpuqd from before priorities existed ignores the request fields.
+        print("gpuq: warning: " + _OLD_DAEMON_HINT + "; job queued at normal priority",
+              file=sys.stderr)
 
     # --- fork the long-lived waiter; parent returns to the shell -----------
     sys.stdout.flush()
@@ -126,30 +143,129 @@ def cmd_submit(args, sock_path: str) -> int:
 
     # Child (waiter): detach fully from the terminal so it survives the shell.
     os.setsid()
-    _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=msgs)
+    _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=msgs,
+                sock_path=sock_path)
     os._exit(0)
 
 
 TERMINATE_GRACE_SECONDS = 10
 
+# Reconnecting after the daemon went away. Retries back off to at most
+# REATTACH_RETRY_MAX_SECONDS apart -- the daemon waits several times that long
+# for waiters after a restart (config.DEFAULT_REATTACH_GRACE) -- and stop after
+# REATTACH_WINDOW_SECONDS: a daemon that stays down that long is not coming
+# back with this queue.
+REATTACH_RETRY_MAX_SECONDS = 5.0
+REATTACH_WINDOW_SECONDS = 24 * 3600
+REATTACH_HANDSHAKE_TIMEOUT = 10.0
 
-def _watch_for_terminate(msgs, proc, logf) -> None:
-    """Kill ``proc``'s process group when the daemon sends 'terminate'.
 
-    Runs in a thread because the waiter's main thread is blocked in
-    ``proc.wait()`` and cannot read the socket. ``msgs`` must be the *same*
-    iterator the waiter used to read ``go``: a fresh ``recv_one`` would start a
-    new generator and silently drop whatever that one had already buffered.
-    On a clean exit the daemon closes the connection, the iterator ends, and
-    this thread returns without touching the process.
+class _DaemonLink:
+    """The waiter's connection to gpuqd, re-established when the daemon restarts.
+
+    Reading is single-threaded by construction: the waiter's main thread reads
+    until ``go``, then :func:`_watch_daemon` is the only reader. ``lock``
+    serialises everything else that touches the connection or the reported
+    state -- a reattach attempt (which swaps the connection) and the main
+    thread's ``done`` -- so the daemon is always told about the job's current
+    state exactly once per connection.
     """
-    try:
-        msg = next(msgs, None)
-    except (OSError, ProtocolError):
-        return
-    if msg is None or msg.get("type") != protocol.TERMINATE:
-        return
 
+    def __init__(self, conn, msgs, sock_path: Optional[str], job_id: str, user: str):
+        self.conn = conn
+        # One iterator per connection: it owns the read buffer, so a message
+        # that arrived in the same packet as the previous one is not lost.
+        self.msgs = msgs
+        self.sock_path = sock_path      # None: cannot reconnect (no reattach)
+        self.job_id = job_id
+        self.user = user
+        self.state = protocol.STATE_QUEUED
+        self.exit_code: Optional[int] = None
+        self.lock = threading.Lock()
+        # Set once nothing more can be done about reporting the exit code: the
+        # daemon acknowledged it, refused the job, or never came back.
+        self.settled = threading.Event()
+        self._delivered = False
+
+    def recv(self) -> Optional[dict]:
+        """The next message, or ``None`` if the connection is gone."""
+        try:
+            return next(self.msgs, None)
+        except (OSError, ProtocolError):
+            return None
+
+    def set_running(self) -> None:
+        with self.lock:
+            self.state = protocol.STATE_RUNNING
+
+    def finish(self, exit_code: int) -> None:
+        """Record the command's exit code and report it on the current
+        connection. If that connection is dead, the next reattach reports it."""
+        with self.lock:
+            self.state = protocol.STATE_FINISHED
+            self.exit_code = exit_code
+            try:
+                protocol.send_msg(self.conn, protocol.done(self.job_id, exit_code))
+            except OSError:
+                pass
+
+    def reattach(self) -> bool:
+        """Reconnect and resume the job with the (possibly new) daemon.
+
+        Returns False if the daemon refuses the job -- it was cancelled, or
+        given up on -- or does not come back within the window. Check
+        :attr:`exit_delivered` afterwards: a reattach made after the command
+        ended has already handed over the exit code.
+        """
+        if self.sock_path is None:
+            return False
+        deadline = time.monotonic() + REATTACH_WINDOW_SECONDS
+        delay = 0.25
+        while time.monotonic() < deadline:
+            with self.lock:
+                reply = self._try_reattach()
+            if reply is not None:
+                return reply.get("type") == protocol.REATTACHED
+            time.sleep(delay)
+            delay = min(delay * 2, REATTACH_RETRY_MAX_SECONDS)
+        return False
+
+    @property
+    def exit_delivered(self) -> bool:
+        return self._delivered
+
+    def _try_reattach(self) -> Optional[dict]:
+        """One attempt; ``None`` means no daemon answered. Caller holds lock."""
+        try:
+            conn = _connect(self.sock_path)
+        except OSError:
+            return None
+        state = self.state
+        try:
+            conn.settimeout(REATTACH_HANDSHAKE_TIMEOUT)
+            protocol.send_msg(conn, protocol.reattach(
+                self.job_id, self.user, state, self.exit_code))
+            msgs = protocol.iter_msgs(conn)
+            reply = next(msgs, None)
+            conn.settimeout(None)
+        except (OSError, ProtocolError):
+            reply = None
+        if reply is None or reply.get("type") != protocol.REATTACHED:
+            conn.close()
+            return reply
+        old, self.conn, self.msgs = self.conn, conn, msgs
+        try:
+            old.close()
+        except OSError:
+            pass
+        self._delivered = state == protocol.STATE_FINISHED
+        return reply
+
+
+def _terminate_command(proc, logf) -> None:
+    """SIGTERM the command's process group, then SIGKILL it after a grace
+    period. Signals the whole group because ``shell=True`` makes the direct
+    child ``/bin/sh``, not the user's real workload."""
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:
@@ -178,21 +294,56 @@ def _watch_for_terminate(msgs, proc, logf) -> None:
         pass
 
 
-def _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=None) -> None:
-    # One iterator for the whole connection: it owns the read buffer, so
-    # handing it to the terminate watcher later cannot lose a message that
-    # arrived in the same packet as 'go'. Callers that already read from this
-    # socket (the pre-fork handshake) must pass their iterator in, for the same
-    # reason -- a fresh one would not see what theirs had buffered.
+def _watch_daemon(link: _DaemonLink, proc, logf) -> None:
+    """The waiter's only reader once the command is running.
+
+    Runs in a thread because the main thread is blocked in ``proc.wait()``.
+    It kills the command's process group on ``terminate``, reattaches when the
+    connection drops, and returns -- setting ``link.settled`` -- once the exit
+    code has been acknowledged or can no longer be delivered. ``proc`` is
+    ``None`` when the command could not be started at all.
+    """
+    try:
+        while True:
+            msg = link.recv()
+            if msg is None:
+                # Connection lost: the daemon restarted, or (a daemon without
+                # done_ack) it closed after taking our 'done'.
+                if not link.reattach() or link.exit_delivered:
+                    return
+                continue
+            mtype = msg.get("type")
+            if mtype == protocol.DONE_ACK:
+                return
+            if mtype == protocol.TERMINATE and proc is not None:
+                _terminate_command(proc, logf)
+    finally:
+        link.settled.set()
+
+
+def _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=None,
+                sock_path=None) -> None:
+    # Callers that already read from this socket (the pre-fork handshake) must
+    # pass their iterator in: a fresh one would not see what theirs had
+    # buffered. ``sock_path`` is what lets the waiter find the daemon again
+    # after a restart.
     if msgs is None:
         msgs = protocol.iter_msgs(conn)
+    link = _DaemonLink(conn, msgs, sock_path, job_id, user)
 
-    # Wait for 'go' (or a cancellation/error closing the connection).
-    go = next(msgs, None)
-    if go is None or go.get("type") != protocol.GO:
-        # Cancelled or daemon went away before granting a slot.
-        os._exit(0)
+    # Wait for 'go'. A dropped connection means the daemon restarted: reattach
+    # and keep waiting. Anything else is the daemon telling us to give up.
+    while True:
+        go = link.recv()
+        if go is None:
+            if not link.reattach():
+                os._exit(0)
+            continue
+        if go.get("type") == protocol.GO:
+            break
+        os._exit(0)  # cancelled
     gpu_ids: List[int] = go.get("gpu_ids", [])
+    link.set_running()
 
     ensure_logs_dir(os.path.dirname(log_file))
     started_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -203,6 +354,7 @@ def _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=None) -
     # Run the command as ourselves, stdout+stderr merged into the log file,
     # which opens with the metadata header first.
     exit_code = 1
+    watcher = None
     try:
         with open(log_file, "a", buffering=1) as logf:
             write_header(logf, {
@@ -219,7 +371,7 @@ def _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=None) -
                 env=env, start_new_session=True,
             )
             watcher = threading.Thread(
-                target=_watch_for_terminate, args=(msgs, proc, logf), daemon=True
+                target=_watch_daemon, args=(link, proc, logf), daemon=True
             )
             watcher.start()
             exit_code = proc.wait()
@@ -231,15 +383,18 @@ def _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=None) -
             pass
         exit_code = 127
 
+    link.finish(exit_code)
+    if watcher is None:
+        # The command never started, so nothing is reading the connection yet.
+        _watch_daemon(link, None, None)
+    # Stay until the daemon has the exit code (or is known not to want it): if
+    # it is down right now, this is what turns "daemon restarted" into a
+    # correct 'done'/'failed' instead of a lost job.
+    link.settled.wait()
     try:
-        protocol.send_msg(conn, protocol.done(job_id, exit_code))
+        link.conn.close()
     except OSError:
         pass
-    finally:
-        try:
-            conn.close()
-        except OSError:
-            pass
 
 
 # --- status / mine ---------------------------------------------------------
@@ -291,16 +446,19 @@ def cmd_status(args, sock_path: str) -> int:
         running = sum(1 for j in jobs if j.get("status") == "running")
         queued = sum(1 for j in jobs if j.get("status") == "queued")
         print(f"Your jobs: {running} running, {queued} queued\n")
-        header = f"{'ID':<7}{'STATUS':<10}{'POS':<5}{'GPU':<6}{'SUBMITTED':<18}{'STARTED':<18}NAME/CMD"
+        header = f"{'ID':<7}{'STATUS':<10}{'POS':<5}{'PRIO':<6}{'GPU':<6}{'SUBMITTED':<18}{'STARTED':<18}NAME/CMD"
     else:
-        header = f"{'ID':<7}{'USER':<9}{'STATUS':<10}{'POS':<5}{'GPU':<6}{'SUBMITTED':<18}{'STARTED':<18}NAME/CMD"
+        header = f"{'ID':<7}{'USER':<9}{'STATUS':<10}{'POS':<5}{'PRIO':<6}{'GPU':<6}{'SUBMITTED':<18}{'STARTED':<18}NAME/CMD"
     print(header)
     for j in jobs:
         pos = j.get("queue_position")
         pos_s = str(pos) if pos else "-"
+        # Only a queued job's non-default priority means anything to a reader.
+        prio = j.get("priority") if j.get("status") == "queued" else None
+        prio_s = str(prio) if prio else "-"
         row = (f"{_short(j['job_id']):<7}"
                + ("" if args.mine else f"{j.get('user',''):<9}")
-               + f"{j.get('status',''):<10}{pos_s:<5}{_gpu_cell(j):<6}"
+               + f"{j.get('status',''):<10}{pos_s:<5}{prio_s:<6}{_gpu_cell(j):<6}"
                + f"{_fmt_time(j.get('submitted_at')):<18}{_fmt_time(j.get('started_at')):<18}"
                + _name_or_cmd(j))
         print(row)
@@ -443,6 +601,44 @@ def _confirm_kill(job: dict) -> bool:
     return reply.strip().lower() in ("y", "yes")
 
 
+# --- priority --------------------------------------------------------------
+
+def cmd_priority(args, sock_path: str) -> int:
+    user = _current_user()
+    try:
+        conn = _connect(sock_path)
+    except OSError as exc:
+        _die(f"cannot reach gpuqd at {sock_path}: {exc}")
+    job = _resolve_active_job(args.job_id, sock_path)
+    if job is None:
+        conn.close()
+        _die(f"no active job matching {args.job_id}")
+    if job.get("status") != "queued":
+        conn.close()
+        _die(f"job {_short(job['job_id'])} is {job.get('status')}; "
+             f"only queued jobs can be reprioritized")
+
+    protocol.send_msg(conn, protocol.prioritize(
+        job["job_id"], user, priority=args.priority, top=bool(args.top)))
+    reply = protocol.recv_one(conn)
+    conn.close()
+    if reply is None:
+        _die("no response from daemon")
+    if reply.get("type") == protocol.ERROR:
+        if (reply.get("code") == ERR_BAD_REQUEST
+                and "unknown message type" in reply.get("message", "")):
+            _die(_OLD_DAEMON_HINT)
+        _die(reply.get("message", "could not change priority"))
+    label = f" ({reply['name']})" if reply.get("name") else ""
+    new, old = reply.get("priority"), reply.get("previous")
+    where = f"position {reply.get('queue_position')} in the queue"
+    if new == old:
+        print(f"Job {_short(job['job_id'])}{label} already has priority {new} ({where})")
+    else:
+        print(f"Job {_short(job['job_id'])}{label} priority {old} -> {new}, now {where}")
+    return 0
+
+
 # --- history ---------------------------------------------------------------
 
 def cmd_history(args, sock_path: str) -> int:
@@ -547,6 +743,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--mem", help="per-GPU memory hint/requirement, e.g. 8G, 512M")
     s.add_argument("--share", action="store_true",
                    help="allow co-locating with other --share jobs (requires --mem)")
+    sp = s.add_mutually_exclusive_group()
+    sp.add_argument("--priority", type=int, default=0,
+                    help="order among your own queued jobs; higher runs first (default 0)")
+    sp.add_argument("--top", action="store_true",
+                    help="put this job ahead of all your other queued jobs")
     s.set_defaults(func=cmd_submit)
 
     st = sub.add_parser("status", help="show queued and running jobs")
@@ -567,6 +768,16 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("-f", "--force", action="store_true",
                     help="kill a running job without confirming")
     cl.set_defaults(func=cmd_cancel)
+
+    pr = sub.add_parser("priority", aliases=["prio"],
+                        help="reorder one of your queued jobs within your own queue")
+    pr.add_argument("job_id", help="job id (prefix ok)")
+    pp = pr.add_mutually_exclusive_group(required=True)
+    pp.add_argument("priority", nargs="?", type=int,
+                    help="new priority; higher runs first, new jobs start at 0")
+    pp.add_argument("--top", action="store_true",
+                    help="put it ahead of all your other queued jobs")
+    pr.set_defaults(func=cmd_priority)
 
     hi = sub.add_parser("history", help="show recently finished jobs")
     hi.add_argument("--limit", type=int, default=20, help="max rows (default 20)")

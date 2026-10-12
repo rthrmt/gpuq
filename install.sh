@@ -28,14 +28,14 @@ echo "=========================================="
 # Step 1: Create system directories. These hold the DB and daemon log, which
 # only root (the daemon) touches — users never read them directly, so no group
 # is needed. Access to gpuq is via the world-accessible socket, not these dirs.
-echo "[1/6] Creating system directories..."
+echo "[1/7] Creating system directories..."
 install -d -o root -g root -m 0755 /var/lib/gpuq
 install -d -o root -g root -m 0755 /var/log/gpuq
 echo "    ✓ /var/lib/gpuq (owner root:root)"
 echo "    ✓ /var/log/gpuq (owner root:root)"
 
 # Step 2: Install the package into a dedicated system venv
-echo "[2/6] Installing gpuq into a system virtualenv..."
+echo "[2/7] Installing gpuq into a system virtualenv..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # A venv is never "externally managed", so pip works regardless of PEP 668.
@@ -63,7 +63,7 @@ ln -sf "$VENV_DIR/bin/gpuqd" "$GPUQD_BIN"
 echo "    ✓ Linked $GPUQ_BIN and $GPUQD_BIN -> $VENV_DIR/bin"
 
 # Step 3: Install the systemd unit, pointing ExecStart at the venv's gpuqd
-echo "[3/6] Installing systemd unit..."
+echo "[3/7] Installing systemd unit..."
 # Use the real venv binary (not the symlink) so the unit is robust even if
 # /usr/local/bin is later cleaned up.
 EXEC_BIN="$VENV_DIR/bin/gpuqd"
@@ -80,7 +80,7 @@ fi
 echo "    ✓ Systemd unit installed: /etc/systemd/system/gpuq.service"
 
 # Step 4: Install configuration file
-echo "[4/6] Installing configuration..."
+echo "[4/7] Installing configuration..."
 if [[ ! -f /etc/gpuq/gpuq.conf ]]; then
     mkdir -p /etc/gpuq
     install -m 0644 "$SCRIPT_DIR/etc/gpuq.conf.example" /etc/gpuq/gpuq.conf
@@ -90,18 +90,39 @@ else
 fi
 
 # Step 5: Reload systemd daemon
-echo "[5/6] Reloading systemd..."
+echo "[5/7] Reloading systemd..."
 systemctl daemon-reload
 echo "    ✓ Systemd configuration reloaded"
 
-# Step 6: Print next steps
-echo "[6/6] Installation complete!"
+# Step 6: On an upgrade, restart the running daemon so it runs the new code.
+# Jobs survive a restart because their waiter processes reattach to the new
+# daemon -- unless the daemon still running is too old to have such waiters.
+# `gpuqd --restart-check` asks the running daemon and exits 0 only if no job
+# would be lost, so the restart is skipped rather than silently dropping work.
+echo "[6/7] Restarting the daemon if it is running..."
+if systemctl is-active --quiet gpuq; then
+    if CHECK_MSG="$("$VENV_DIR/bin/gpuqd" --restart-check 2>&1)"; then
+        echo "    ℹ $CHECK_MSG"
+        systemctl restart gpuq
+        echo "    ✓ gpuqd restarted and now runs the new version"
+    else
+        echo "    ⚠ $CHECK_MSG"
+        echo "    ⚠ gpuqd was NOT restarted: it keeps running the previous version."
+        echo "      Restart it yourself once 'gpuq status' shows no jobs you need:"
+        echo "        sudo systemctl restart gpuq"
+    fi
+else
+    echo "    ℹ gpuqd is not running; nothing to restart"
+fi
+
+# Step 7: Print next steps
+echo "[7/7] Installation complete!"
 echo ""
 echo "=========================================="
 echo "Next steps:"
 echo "=========================================="
 echo ""
-echo "1. Enable and start the service:"
+echo "1. Enable and start the service (if it is not running yet):"
 echo "   sudo systemctl enable --now gpuq"
 echo ""
 echo "2. Verify the service is running:"

@@ -7,8 +7,12 @@ which GPUs. The daemon owns the side effects (DB writes, sending ``go``).
 Scheduling contract
 --------------------
 1. **Fairness selects WHICH job.** Order queued jobs by ``(running_count[user],
-   submitted_at, job_id)`` — the user with the fewest running jobs goes first,
-   ties broken FIFO.
+   queue slot)`` — the user with the fewest running jobs goes first, ties
+   broken FIFO.
+   **Priority only reorders a user's own jobs.** Each queued job contributes
+   one FIFO slot ``(submitted_at, job_id)`` to its owner; the owner's jobs fill
+   those slots highest-priority first (see :func:`queue_slots`). A user's place
+   relative to *other* users is therefore untouched by any priority they set.
 2. **Placement decides IF/WHERE it fits.** :func:`try_place` returns a list of
    GPU ids (exactly ``gpus_requested`` of them) or ``None``.
 3. **Skip, don't block.** If the fairest job can't be placed, try the next
@@ -17,7 +21,7 @@ Scheduling contract
 4. Multi-GPU is **atomic**: a job gets all N GPUs or none.
 """
 
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .gpustate import GpuState
 
@@ -27,23 +31,61 @@ class SchedJob:
     from the DB ``Job`` dataclass so the algorithm is easy to test."""
 
     __slots__ = ("job_id", "user", "gpus_requested", "mem_requested",
-                 "shareable", "submitted_at")
+                 "shareable", "submitted_at", "priority")
 
     def __init__(self, job_id, user, gpus_requested, mem_requested,
-                 shareable, submitted_at):
+                 shareable, submitted_at, priority=0):
         self.job_id = job_id
         self.user = user
         self.gpus_requested = gpus_requested
         self.mem_requested = mem_requested
         self.shareable = shareable
         self.submitted_at = submitted_at
+        self.priority = priority
+
+
+def queue_slots(jobs: Sequence) -> Dict[str, Tuple[str, str]]:
+    """Map each job id to the FIFO slot it competes with.
+
+    A slot is the ``(submitted_at, job_id)`` of one of the owner's queued jobs.
+    Per user, the slots are handed out earliest-first to that user's jobs
+    ranked by ``(-priority, submitted_at, job_id)``. With equal priorities this
+    is the identity, i.e. plain FIFO. Raising a priority swaps slots among the
+    owner's own jobs and never creates an earlier slot, so it cannot move a job
+    ahead of another user's.
+
+    Works on anything with ``job_id``/``user``/``submitted_at``/``priority``
+    (``SchedJob`` or the DB ``Job``).
+    """
+    by_user: Dict[str, list] = {}
+    for j in jobs:
+        by_user.setdefault(j.user, []).append(j)
+    slots: Dict[str, Tuple[str, str]] = {}
+    for user_jobs in by_user.values():
+        fifo = sorted((j.submitted_at, j.job_id) for j in user_jobs)
+        ranked = sorted(
+            user_jobs, key=lambda j: (-j.priority, j.submitted_at, j.job_id))
+        for j, slot in zip(ranked, fifo):
+            slots[j.job_id] = slot
+    return slots
+
+
+def queue_order(jobs: Sequence) -> list:
+    """Return jobs in queue order: FIFO slots, priorities applied per user.
+
+    This is the order shown to users as the queue position. It ignores running
+    counts; :func:`fair_order` layers fairness on top of the same slots.
+    """
+    slots = queue_slots(jobs)
+    return sorted(jobs, key=lambda j: slots[j.job_id])
 
 
 def fair_order(jobs: Sequence[SchedJob], running_counts: Dict[str, int]) -> List[SchedJob]:
-    """Return jobs ordered fairest-first (fewest running, then FIFO)."""
+    """Return jobs ordered fairest-first (fewest running, then queue slot)."""
+    slots = queue_slots(jobs)
     return sorted(
         jobs,
-        key=lambda j: (running_counts.get(j.user, 0), j.submitted_at, j.job_id),
+        key=lambda j: (running_counts.get(j.user, 0),) + slots[j.job_id],
     )
 
 
