@@ -327,7 +327,7 @@ def cmd_logs(args, sock_path: str) -> int:
     if args.follow:
         _tail_follow(log_file)
     else:
-        with open(log_file) as f:
+        with open(log_file, newline="") as f:
             sys.stdout.write(f.read())
     return 0
 
@@ -351,7 +351,10 @@ def _resolve_log_file(prefix: str, active_jobs: list, sock_path: str) -> Optiona
 
 
 def _tail_follow(path: str) -> None:
-    with open(path) as f:
+    # newline="": keep "\r" as written. Text mode's default would translate it to "\n", so a
+    # progress bar (tqdm redraws its line with "\r") would print every refresh as a new line
+    # instead of updating in place, unlike `cat`/`tail -f` on the same file.
+    with open(path, newline="") as f:
         sys.stdout.write(f.read())
         sys.stdout.flush()
         try:
