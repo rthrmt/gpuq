@@ -23,6 +23,7 @@ from gpuq import protocol
 
 REPO = Path(__file__).resolve().parent.parent
 FAKE_SMI = REPO / "tests" / "fakebin" / "nvidia-smi"
+FAKE_SENDMAIL = REPO / "tests" / "fakebin" / "sendmail"
 GB = 1024  # the shim file uses MiB; 1024 MiB = 1 GiB
 
 
@@ -181,7 +182,7 @@ def submit(daemon):
     forked = []
 
     def _submit(cmd, *, name=None, gpus=1, mem=None, share=False, user="tester",
-                priority=0, top=False, submitted_at=None):
+                priority=0, top=False, submitted_at=None, notify_to=None):
         from gpuq import cli
         from gpuq.sizeutil import parse_size
 
@@ -213,7 +214,8 @@ def submit(daemon):
             os.setsid()
             args = type("A", (), {"name": name, "share": share})()
             cli._run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes,
-                            msgs=msgs, sock_path=daemon.socket_path)
+                            msgs=msgs, sock_path=daemon.socket_path,
+                            notify_to=notify_to)
             os._exit(0)
         forked.append(pid)
         conn.close()
@@ -222,6 +224,26 @@ def submit(daemon):
     _submit.waiter_pids = forked
     yield _submit
     kill_waiters(forked)
+
+
+@pytest.fixture
+def mailbox(tmp_path, monkeypatch):
+    """Route job-completion emails to the fake sendmail. Waiters are forked
+    from the test process, so they inherit these variables. Returns a function
+    that reads back the messages delivered so far."""
+    from email import message_from_string, policy
+
+    path = tmp_path / "mailbox"
+    monkeypatch.setenv("GPUQ_SENDMAIL", str(FAKE_SENDMAIL))
+    monkeypatch.setenv("GPUQ_FAKE_MAILBOX", str(path))
+
+    def read():
+        if not path.exists():
+            return []
+        chunks = path.read_text().split("\n=== end of message ===\n")
+        return [message_from_string(c, policy=policy.default) for c in chunks if c.strip()]
+
+    return read
 
 
 def kill_waiters(pids):

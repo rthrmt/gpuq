@@ -8,6 +8,10 @@ The environment seams (``GPUQ_SOCKET``, ``GPUQ_DB``, ``GPUQ_LOG``, ``GPUQ_CONF``
 ``GPUQ_NVIDIA_SMI``, ``GPUQ_REATTACH_GRACE``) make it possible to run a daemon + client entirely in user
 space for development and tests, without touching ``/etc`` or ``/var`` and
 without root.
+
+The client also reads a per-user file (``~/.config/gpuq/config``, see
+:func:`user_conf_path`) for personal submit defaults such as the notification
+email address. ``GPUQ_USER_CONF`` and ``GPUQ_SENDMAIL`` are its test seams.
 """
 
 import configparser
@@ -21,6 +25,7 @@ DEFAULT_CONF_PATH = "/etc/gpuq/gpuq.conf"
 DEFAULT_SOCKET_PATH = "/run/gpuq/gpuq.sock"
 DEFAULT_DB_PATH = "/var/lib/gpuq/queue.db"
 DEFAULT_LOG_PATH = "/var/log/gpuq/daemon.log"
+DEFAULT_SENDMAIL_PATH = "/usr/sbin/sendmail"
 DEFAULT_POLL_INTERVAL = 5.0
 DEFAULT_IDLE_THRESHOLD_MB = 500
 # How long a freshly started daemon waits for the waiters of the jobs it finds
@@ -159,19 +164,59 @@ def load_config(
     )
 
 
+def _system_option(section: str, key: str) -> Optional[str]:
+    """One value from the system config file, or None. Errors are ignored:
+    the client must keep working when it cannot make sense of the file."""
+    found = _conf_path(None)
+    if found:
+        parser = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+        try:
+            parser.read(found)
+            if parser.has_option(section, key):
+                return parser.get(section, key)
+        except configparser.Error:
+            pass
+    return None
+
+
 def client_socket_path(explicit: Optional[str] = None) -> str:
     """Resolve just the socket path for the CLI client (no full config needed)."""
     if explicit:
         return explicit
     if os.environ.get("GPUQ_SOCKET"):
         return os.environ["GPUQ_SOCKET"]
-    found = _conf_path(None)
-    if found:
-        parser = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
-        try:
-            parser.read(found)
-            if parser.has_option("daemon", "socket_path"):
-                return parser.get("daemon", "socket_path")
-        except configparser.Error:
-            pass
-    return DEFAULT_SOCKET_PATH
+    return _system_option("daemon", "socket_path") or DEFAULT_SOCKET_PATH
+
+
+def client_sendmail_path() -> str:
+    """The sendmail-compatible binary a waiter hands notification emails to:
+    ``GPUQ_SENDMAIL`` (test seam), else ``[mail] sendmail`` in the system
+    config, else ``/usr/sbin/sendmail``."""
+    if os.environ.get("GPUQ_SENDMAIL"):
+        return os.environ["GPUQ_SENDMAIL"]
+    return (_system_option("mail", "sendmail") or "").strip() or DEFAULT_SENDMAIL_PATH
+
+
+def user_conf_path() -> str:
+    """The per-user config file: ``GPUQ_USER_CONF``, else
+    ``$XDG_CONFIG_HOME/gpuq/config`` (``~/.config/gpuq/config``)."""
+    if os.environ.get("GPUQ_USER_CONF"):
+        return os.environ["GPUQ_USER_CONF"]
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join("~", ".config")
+    return os.path.expanduser(os.path.join(base, "gpuq", "config"))
+
+
+def user_default_email(path: Optional[str] = None) -> Optional[str]:
+    """``[notify] email`` from the per-user config file, or None if the file
+    or the setting is absent. A file that does not parse is a ConfigError, so
+    a typo is reported instead of silently disabling notifications."""
+    path = path or user_conf_path()
+    if not os.path.exists(path):
+        return None
+    parser = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+    try:
+        parser.read(path)
+    except configparser.Error as exc:
+        raise ConfigError(f"failed to parse {path}: {exc}") from exc
+    value = parser.get("notify", "email", fallback="").strip()
+    return value or None

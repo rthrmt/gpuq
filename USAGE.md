@@ -55,6 +55,7 @@ all set. (If `python3` isn't your interpreter, swap in the right path — see
 
 ```
 gpuq submit "<command>" [--name NAME] [--gpus N] [--mem SIZE] [--share] [--priority N | --top]
+                        [--email ADDR | --no-email]
 ```
 
 Your shell returns immediately. A background process holds your place in line
@@ -68,6 +69,8 @@ and runs the command when gpuq grants a GPU.
 | `--share` | off | Allow co-locating with other `--share` jobs (requires `--mem`) |
 | `--priority N` | `0` | Order among **your own** queued jobs; higher runs first |
 | `--top` | off | Queue ahead of all your other queued jobs |
+| `--email ADDR` | your default | Email `ADDR` (comma-separated for several) when the job ends |
+| `--no-email` | off | No email for this job, even if you set a default |
 
 ```bash
 gpuq submit "python train.py --lr 0.001" --name baseline
@@ -78,6 +81,22 @@ gpuq submit "python eval.py" --name eval --gpus 1 --mem 8G --share
 Validation errors (bad `--mem`, `--share` without `--mem`, asking for more GPUs
 than exist, daemon down) are reported in your shell right away and nothing is
 queued.
+
+#### Email when a job ends
+
+`--email you@example.org` sends a short mail when the job finishes, fails or is
+cancelled while running: exit code, runtime, GPUs, log path and the last 20
+lines of the log. To get it for every job, set a default once:
+
+```ini
+# ~/.config/gpuq/config
+[notify]
+email = you@example.org
+```
+
+`--email` overrides it for one job, `--no-email` turns it off for one job. The
+mail comes from your own account via the server's mail system. If it can't be
+sent, a `# gpuq: could not send email ...` line is added to the job's log.
 
 ### `status` / `mine`
 

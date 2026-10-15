@@ -22,6 +22,7 @@ import argparse
 import datetime
 import getpass
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -31,9 +32,9 @@ import time
 import uuid
 from typing import List, Optional
 
-from . import protocol
-from .config import client_socket_path
-from .errors import ERR_BAD_REQUEST, ProtocolError
+from . import notify, protocol
+from .config import client_sendmail_path, client_socket_path, user_default_email
+from .errors import ERR_BAD_REQUEST, ConfigError, ProtocolError
 from .logfile import compute_log_path, ensure_logs_dir, write_header
 from .sizeutil import format_size, parse_size
 
@@ -77,6 +78,7 @@ def cmd_submit(args, sock_path: str) -> int:
             _die(str(exc))
     if args.share and mem_bytes is None:
         _die("--share requires --mem (e.g. --mem 8G)")
+    notify_to = _resolve_notify_to(args)
 
     cmd = args.command
     user = _current_user()
@@ -127,6 +129,12 @@ def cmd_submit(args, sock_path: str) -> int:
     if extra:
         print("  " + ", ".join(extra))
     print(f"Logs: {log_file}")
+    if notify_to:
+        print(f"Email: {', '.join(notify_to)} when it ends")
+        sendmail = client_sendmail_path()
+        if not shutil.which(sendmail):
+            print(f"gpuq: warning: {sendmail} not found; no email will be sent",
+                  file=sys.stderr)
     if "priority" not in reply and (args.priority or args.top):
         # A gpuqd from before priorities existed ignores the request fields.
         print("gpuq: warning: " + _OLD_DAEMON_HINT + "; job queued at normal priority",
@@ -144,8 +152,28 @@ def cmd_submit(args, sock_path: str) -> int:
     # Child (waiter): detach fully from the terminal so it survives the shell.
     os.setsid()
     _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=msgs,
-                sock_path=sock_path)
+                sock_path=sock_path, notify_to=notify_to)
     os._exit(0)
+
+
+def _resolve_notify_to(args) -> Optional[List[str]]:
+    """Who to email when the job ends: ``--email``, else the per-user config
+    default, unless ``--no-email``. Checked before the fork so a bad address is
+    reported in the user's shell."""
+    if args.no_email:
+        return None
+    raw = args.email
+    if raw is None:
+        try:
+            raw = user_default_email()
+        except ConfigError as exc:
+            _die(str(exc))
+        if raw is None:
+            return None
+    try:
+        return notify.parse_addresses(raw)
+    except ValueError as exc:
+        _die(str(exc))
 
 
 TERMINATE_GRACE_SECONDS = 10
@@ -186,6 +214,8 @@ class _DaemonLink:
         # daemon acknowledged it, refused the job, or never came back.
         self.settled = threading.Event()
         self._delivered = False
+        # The daemon asked us to kill the command (a cancel of a running job).
+        self.terminated = False
 
     def recv(self) -> Optional[dict]:
         """The next message, or ``None`` if the connection is gone."""
@@ -316,13 +346,36 @@ def _watch_daemon(link: _DaemonLink, proc, logf) -> None:
             if mtype == protocol.DONE_ACK:
                 return
             if mtype == protocol.TERMINATE and proc is not None:
+                link.terminated = True
                 _terminate_command(proc, logf)
     finally:
         link.settled.set()
 
 
+def _send_notification(notify_to, job_id, cmd, name, gpu_ids, exit_code, cancelled,
+                       started, log_file) -> None:
+    """Email the job's outcome; a failure is noted in the job log, which is the
+    only place a detached waiter can tell the user about it."""
+    try:
+        msg = notify.build_message(
+            to=notify_to, job_id=job_id, name=name, cmd=cmd,
+            host=socket.gethostname(), gpu_ids=gpu_ids, exit_code=exit_code,
+            cancelled=cancelled, started_at=started,
+            finished_at=datetime.datetime.now(datetime.timezone.utc),
+            log_file=log_file, log_tail=notify.tail_log(log_file),
+        )
+        notify.send(msg, client_sendmail_path())
+    except Exception as exc:  # noqa: BLE001
+        try:
+            with open(log_file, "a") as logf:
+                logf.write(f"\n# gpuq: could not send email to "
+                           f"{', '.join(notify_to)}: {exc}\n")
+        except OSError:
+            pass
+
+
 def _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=None,
-                sock_path=None) -> None:
+                sock_path=None, notify_to=None) -> None:
     # Callers that already read from this socket (the pre-fork handshake) must
     # pass their iterator in: a fresh one would not see what theirs had
     # buffered. ``sock_path`` is what lets the waiter find the daemon again
@@ -346,7 +399,8 @@ def _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=None,
     link.set_running()
 
     ensure_logs_dir(os.path.dirname(log_file))
-    started_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    started = datetime.datetime.now(datetime.timezone.utc)
+    started_at = started.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
@@ -384,6 +438,10 @@ def _run_waiter(conn, job_id, cmd, log_file, user, args, mem_bytes, msgs=None,
         exit_code = 127
 
     link.finish(exit_code)
+    if notify_to:
+        # After 'done', so the GPUs are released without waiting on the mail.
+        _send_notification(notify_to, job_id, cmd, args.name, gpu_ids, exit_code,
+                           link.terminated, started, log_file)
     if watcher is None:
         # The command never started, so nothing is reading the connection yet.
         _watch_daemon(link, None, None)
@@ -748,6 +806,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="order among your own queued jobs; higher runs first (default 0)")
     sp.add_argument("--top", action="store_true",
                     help="put this job ahead of all your other queued jobs")
+    se = s.add_mutually_exclusive_group()
+    se.add_argument("--email", metavar="ADDR",
+                    help="email ADDR (comma-separated for several) when the job ends; "
+                         "default: [notify] email in ~/.config/gpuq/config")
+    se.add_argument("--no-email", action="store_true",
+                    help="no email for this job, even if a default is configured")
     s.set_defaults(func=cmd_submit)
 
     st = sub.add_parser("status", help="show queued and running jobs")

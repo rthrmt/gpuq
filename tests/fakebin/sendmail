@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Fake sendmail for testing gpuq's job-completion emails.
+
+Appends each message it is given on stdin to the file named by
+GPUQ_FAKE_MAILBOX, followed by a separator line, so a test can read back what
+the waiter sent. Exits with GPUQ_FAKE_SENDMAIL_EXIT (default 0) to exercise
+delivery failures; a non-zero exit also writes a line to stderr, like a real
+MTA would.
+"""
+
+import os
+import sys
+
+SEPARATOR = "\n=== end of message ===\n"
+
+data = sys.stdin.buffer.read()
+code = int(os.environ.get("GPUQ_FAKE_SENDMAIL_EXIT", "0"))
+if code:
+    sys.stderr.write("fake sendmail: delivery refused\n")
+    sys.exit(code)
+mailbox = os.environ.get("GPUQ_FAKE_MAILBOX")
+if mailbox:
+    with open(mailbox, "ab") as f:
+        f.write(data + SEPARATOR.encode())

@@ -9,6 +9,8 @@ from datetime import datetime
 from typing import Optional
 
 _DEFAULT_LOGS_DIR = os.path.join("~", ".gpuq", "logs")
+HEADER_START = "# gpuq job log"
+HEADER_END = "# " + "-" * 60
 
 
 def sanitize_cmd(cmd: str) -> str:
@@ -116,10 +118,10 @@ def write_header(fileobj, meta: dict) -> None:
         meta:    Dict with optional keys: job_id, user, cmd, name, gpu_ids,
                  mem_requested_human, shareable, submitted_at, started_at.
     """
-    fileobj.write("# gpuq job log\n")
+    fileobj.write(HEADER_START + "\n")
     for key, value in meta.items():
         if value is None:
             continue
         fileobj.write(f"# gpuq {key}: {value}\n")
-    fileobj.write("# " + "-" * 60 + "\n")
+    fileobj.write(HEADER_END + "\n")
     fileobj.flush()

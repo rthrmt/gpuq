@@ -128,7 +128,7 @@ All subcommands support `--socket <path>` to override the socket location.
 
 ```
 gpuq submit <command> [--name NAME] [--gpus N] [--mem SIZE] [--share]
-                      [--priority N | --top]
+                      [--priority N | --top] [--email ADDR | --no-email]
 ```
 
 The shell returns immediately after the job is accepted. A background waiter
@@ -162,6 +162,21 @@ gpuq submit "python eval.py" --name eval --gpus 1 --mem 8G --share
 | `--share` | off | Allow co-location with other `--share` jobs. Requires `--mem`. |
 | `--priority N` | `0` | Order among **your own** queued jobs; higher runs first. See [`priority`](#priority--reorder-your-own-queued-jobs). |
 | `--top` | off | Queue this job ahead of all your other queued jobs (instead of `--priority`). |
+| `--email ADDR` | `[notify] email` | Email `ADDR` (comma-separated for several) when the job ends: status, exit code, runtime, GPUs, log path and the log's last 20 lines. |
+| `--no-email` | off | Send no email for this job, even if a per-user default is set. |
+
+**Per-user defaults** live in `~/.config/gpuq/config` (`$XDG_CONFIG_HOME/gpuq/config`):
+
+```ini
+[notify]
+email = alice@example.org   ; email me about every job unless --no-email
+```
+
+The email is sent by the job's own waiter process, as the submitting user,
+through the local `sendmail` binary (see `[mail]` under
+[Configuration](#configuration)); the daemon is not involved. A delivery
+failure is noted at the end of the job log. Queued jobs that are cancelled
+never started, so they send nothing.
 
 #### Using your own virtualenv / conda environment
 
@@ -411,6 +426,9 @@ idle_memory_threshold_mb = 500
 
 [fairness]
 max_gpus_per_user = 0    ; 0 = unlimited
+
+[mail]
+# sendmail = /usr/sbin/sendmail   ; any sendmail-compatible binary
 ```
 
 | Key | Section | Default | Description |
@@ -424,6 +442,7 @@ max_gpus_per_user = 0    ; 0 = unlimited
 | `managed_gpus` | `[gpus]` | (all) | Comma-separated list of GPU indices to manage; omit to use all GPUs reported by nvidia-smi |
 | `idle_memory_threshold_mb` | `[gpus]` | `500` | A GPU whose live `nvidia-smi` memory use exceeds this is treated as occupied (not free for exclusive jobs) |
 | `max_gpus_per_user` | `[fairness]` | `0` | Maximum GPUs a single user may hold simultaneously; `0` means unlimited |
+| `sendmail` | `[mail]` | `/usr/sbin/sendmail` | Binary used for job-completion emails, called as `sendmail -t -oi` with the message on stdin. Anything sendmail-compatible works (postfix, exim, `msmtp-mta`, nullmailer); relays and credentials are configured there, not in gpuq. Read by the CLI, so no daemon restart is needed. |
 
 **Override precedence (highest first):** CLI flag > environment variable
 (`GPUQ_SOCKET`, `GPUQ_DB`, `GPUQ_LOG`, `GPUQ_CONF`) > config file > built-in default.
