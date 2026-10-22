@@ -229,6 +229,54 @@ def test_cross_user_cancel_rejected(daemon, submit):
     assert reply["type"] == "error" and reply["code"] == "permission_denied"
 
 
+def test_status_lists_queue_in_expected_start_order(daemon, submit, tmp_path):
+    """The queue shown to users is the order jobs are expected to start in:
+    a user with nothing running is listed -- and served -- ahead of earlier
+    submissions by the user who holds all the GPUs."""
+    from gpuq import protocol
+    order = tmp_path / "order.txt"
+    _, h1, _ = submit("sleep 60", user="alice")       # default fixture: 2 GPUs
+    _, h2, _ = submit("sleep 60", user="alice")
+    assert wait_until(lambda: _db_status(daemon, h1)[0] == "running"
+                      and _db_status(daemon, h2)[0] == "running")
+    _, a1, _ = submit(f"echo alice >> {order}", user="alice",
+                      submitted_at="2026-01-01T00:00:01Z")
+    kind, b1, _ = submit(f"echo bob >> {order}", user="bob",
+                         submitted_at="2026-01-01T00:00:02Z")
+    assert wait_until(lambda: len(daemon.status()) == 4)
+
+    queued = [(j["job_id"], j["queue_position"]) for j in daemon.status()
+              if j["status"] == "queued"]
+    assert queued == [(b1, 1), (a1, 2)]
+
+    daemon.request(protocol.cancel(h1, "alice", force=True))
+    assert wait_until(lambda: order.exists()
+                      and len(order.read_text().split()) == 2, timeout=15)
+    assert order.read_text().split() == ["bob", "alice"]
+
+
+def test_single_gpu_queue_is_listed_and_served_fifo(daemon, submit, tmp_path):
+    """With one GPU the slot always opens by its holder's job ending, which
+    levels the running counts, so the earlier submission is next -- and the
+    listing must say so rather than promise the other user the GPU."""
+    from gpuq import protocol
+    daemon.set_gpus([(0, 0, 24576, 24576)])
+    order = tmp_path / "order.txt"
+    _, holder, _ = submit("sleep 60", user="alice")
+    assert wait_until(lambda: _db_status(daemon, holder)[0] == "running")
+    _, a1, _ = submit(f"echo alice >> {order}", user="alice",
+                      submitted_at="2026-01-01T00:00:01Z")
+    _, b1, _ = submit(f"echo bob >> {order}", user="bob",
+                      submitted_at="2026-01-01T00:00:02Z")
+    assert wait_until(lambda: len(daemon.status()) == 3)
+    assert [j["job_id"] for j in daemon.status() if j["status"] == "queued"] == [a1, b1]
+
+    daemon.request(protocol.cancel(holder, "alice", force=True))
+    assert wait_until(lambda: order.exists()
+                      and len(order.read_text().split()) == 2, timeout=15)
+    assert order.read_text().split() == ["alice", "bob"]
+
+
 def test_fairness_bob_runs_alongside_alice(daemon, submit):
     daemon.set_gpus([(0, 0, 24576, 24576), (1, 0, 24576, 24576)])  # 2 GPUs
     # Alice submits 3 first, Bob 1 last; Bob (fewer running) should still get a GPU.
