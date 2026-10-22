@@ -40,7 +40,7 @@ from .config import Config, load_config
 from .db import Database, Job
 from .gpu import NvidiaSmiError, query_gpu_processes, query_gpus
 from .gpustate import GpuState
-from .scheduler import SchedJob, queue_order, schedule_pass
+from .scheduler import SchedJob, schedule_pass, start_order
 
 logger = logging.getLogger("gpuq.daemon")
 
@@ -688,8 +688,12 @@ class Daemon:
             by_user.setdefault(j.user, set()).add(j.job_id)
         return self.state.gpus_held_by_user_jobs(by_user)
 
+    def _start_order(self, queued: List[Job]) -> List[Job]:
+        """Queued jobs in the order the scheduler is expected to start them."""
+        return start_order(queued, [j.user for j in self.db.running_jobs()])
+
     def _queue_position(self, job_id: str) -> int:
-        for i, j in enumerate(queue_order(self.db.queued_jobs_ordered()), start=1):
+        for i, j in enumerate(self._start_order(self.db.queued_jobs_ordered()), start=1):
             if j.job_id == job_id:
                 return i
         return 0
@@ -718,8 +722,9 @@ class Daemon:
     def _reply_status(self, conn: socket.socket) -> None:
         active = self.db.active_jobs()
         running = [j for j in active if j.status != "queued"]
-        # Listed in queue order, so priorities show up as the order of the rows.
-        queued = queue_order([j for j in active if j.status == "queued"])
+        # Listed in expected start order, so fairness and priorities show up
+        # as the order of the rows.
+        queued = self._start_order([j for j in active if j.status == "queued"])
         queue_pos = {j.job_id: i for i, j in enumerate(queued, start=1)}
         jobs = [self._job_to_dict(j, queue_pos.get(j.job_id))
                 for j in running + queued]

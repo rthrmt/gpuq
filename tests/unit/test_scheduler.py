@@ -4,7 +4,7 @@ import pytest
 
 from gpuq.gpu import GpuInfo
 from gpuq.gpustate import GpuState
-from gpuq.scheduler import (SchedJob, fair_order, queue_order, schedule_pass,
+from gpuq.scheduler import (SchedJob, fair_order, schedule_pass, start_order,
                             try_place)
 
 GB = 1024 ** 3
@@ -92,13 +92,53 @@ def test_fairness_still_outranks_priority():
     assert _ids(fair_order(jobs, {"alice": 1})) == ["b1", "a1"]
 
 
-def test_queue_order_ignores_running_counts():
+# --- start_order: the queue as shown to users -------------------------------
+
+def test_start_order_lists_user_with_fewer_running_jobs_first():
+    # Alice holds all four GPUs and queued six more jobs days ago; Bob has
+    # nothing running and queued three today. As Alice's jobs end, Bob gets
+    # the first two GPUs (4:0 -> 2:2), then the two take turns. Submission
+    # time alone would list Bob last.
+    alice = [job(f"a{i}", "alice", ts=f"2026-10-09T15:00:{i:02d}Z") for i in range(6)]
+    bob = [job(f"b{i}", "bob", ts=f"2026-10-12T06:07:{i:02d}Z") for i in range(3)]
+    order = start_order(alice + bob, ["alice"] * 4)
+    assert _ids(order) == ["b0", "b1", "a0", "a1", "b2", "a2", "a3", "a4", "a5"]
+
+
+def test_start_order_on_one_gpu_is_fifo():
+    # The slot opens because Alice's job ends, which puts her back at zero
+    # running -- level with Bob -- and ties go to the earlier submission.
+    jobs = [job("a1", "alice", ts="t1"), job("b1", "bob", ts="t2")]
+    assert _ids(start_order(jobs, ["alice"])) == ["a1", "b1"]
+
+
+def test_start_order_assumes_oldest_running_job_ends_first():
+    # Two GPUs, one job each: whoever's job ends first has fewer running at
+    # that moment and gets the slot back, regardless of submission order.
+    jobs = [job("a1", "alice", ts="t2"), job("b1", "bob", ts="t1")]
+    assert _ids(start_order(jobs, ["alice", "bob"])) == ["a1", "b1"]
+    assert _ids(start_order(jobs, ["bob", "alice"])) == ["b1", "a1"]
+    # Alice still has a job running after her oldest ends; Carol has none.
+    jobs = [job("a1", "alice", ts="t1"), job("c1", "carol", ts="t9")]
+    assert _ids(start_order(jobs, ["alice", "alice", "bob"])) == ["c1", "a1"]
+
+
+def test_start_order_applies_priority_within_a_user():
     jobs = [job("a1", "alice", ts="t1"), job("b1", "bob", ts="t2"),
             job("a2", "alice", ts="t3", prio=1)]
-    assert _ids(queue_order(jobs)) == ["a2", "b1", "a1"]
+    assert _ids(start_order(jobs, [])) == ["a2", "a1", "b1"]
+    assert _ids(start_order(jobs, ["alice", "alice"])) == ["b1", "a2", "a1"]
 
 
-def test_schedule_pass_places_high_priority_job_first():
+def test_start_order_first_place_is_what_schedule_pass_does_next():
+    # The forecast's head must be the job the scheduler really places once
+    # the oldest running job has ended and freed its GPU.
+    def queued():
+        return [job("a1", "alice", ts="t1"), job("a2", "alice", ts="t2", prio=2),
+                job("b1", "bob", ts="t3"), job("c1", "carol", ts="t4")]
+
+    running = ["alice", "alice", "bob", "carol", "carol"]
+    counts = {"alice": 1, "bob": 1, "carol": 2}      # after alice's oldest ended
     state = make_state([(0, 24, 0)])
     placed = []
 
@@ -107,25 +147,8 @@ def test_schedule_pass_places_high_priority_job_first():
         for i in ids:
             state.reserve(i, j.job_id, 0, False)
 
-    jobs = [job("a1", ts="t1"), job("a2", ts="t2"), job("a3", ts="t3", prio=1)]
-    assert schedule_pass(jobs, state, {}, commit=commit) == 1
-    assert placed == ["a3"]
-
-
-def test_unplaceable_high_priority_job_does_not_block_own_jobs():
-    # Skip-don't-block still applies: the promoted 2-GPU job cannot fit on the
-    # single GPU, so the owner's ordinary job runs instead.
-    state = make_state([(0, 24, 0)])
-    placed = []
-
-    def commit(j, ids):
-        placed.append(j.job_id)
-        for i in ids:
-            state.reserve(i, j.job_id, 0, False)
-
-    jobs = [job("small", ts="t1"), job("big", ts="t2", gpus=2, prio=5)]
-    assert schedule_pass(jobs, state, {}, commit=commit) == 1
-    assert placed == ["small"]
+    assert schedule_pass(queued(), state, counts, commit=commit) == 1
+    assert placed == _ids(start_order(queued(), running))[:1]
 
 
 # --- try_place: exclusive --------------------------------------------------

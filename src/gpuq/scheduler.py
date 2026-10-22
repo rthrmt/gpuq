@@ -13,6 +13,8 @@ Scheduling contract
    one FIFO slot ``(submitted_at, job_id)`` to its owner; the owner's jobs fill
    those slots highest-priority first (see :func:`queue_slots`). A user's place
    relative to *other* users is therefore untouched by any priority they set.
+   :func:`start_order` forecasts the whole queue with the same ranking, for
+   display.
 2. **Placement decides IF/WHERE it fits.** :func:`try_place` returns a list of
    GPU ids (exactly ``gpus_requested`` of them) or ``None``.
 3. **Skip, don't block.** If the fairest job can't be placed, try the next
@@ -21,6 +23,7 @@ Scheduling contract
 4. Multi-GPU is **atomic**: a job gets all N GPUs or none.
 """
 
+from collections import deque
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .gpustate import GpuState
@@ -70,16 +73,6 @@ def queue_slots(jobs: Sequence) -> Dict[str, Tuple[str, str]]:
     return slots
 
 
-def queue_order(jobs: Sequence) -> list:
-    """Return jobs in queue order: FIFO slots, priorities applied per user.
-
-    This is the order shown to users as the queue position. It ignores running
-    counts; :func:`fair_order` layers fairness on top of the same slots.
-    """
-    slots = queue_slots(jobs)
-    return sorted(jobs, key=lambda j: slots[j.job_id])
-
-
 def fair_order(jobs: Sequence[SchedJob], running_counts: Dict[str, int]) -> List[SchedJob]:
     """Return jobs ordered fairest-first (fewest running, then queue slot)."""
     slots = queue_slots(jobs)
@@ -87,6 +80,37 @@ def fair_order(jobs: Sequence[SchedJob], running_counts: Dict[str, int]) -> List
         jobs,
         key=lambda j: (running_counts.get(j.user, 0),) + slots[j.job_id],
     )
+
+
+def start_order(jobs: Sequence, running_users: Sequence[str]) -> list:
+    """Return queued jobs in the order they are expected to start.
+
+    This is what users are shown as the queue (``POS`` in ``gpuq status``).
+    A queued job starts when a running one ends, and that lowers its owner's
+    running count *before* fairness picks the successor. So the forecast
+    replays exactly that: the running jobs (``running_users``: their owners,
+    oldest-started first) are assumed to end in the order they started, and
+    each time one does, :func:`fair_order` picks the next job, which then
+    joins the back of the running list.
+
+    It is a forecast, not a promise: jobs do not really finish in start order,
+    and a job may not fit the GPU that frees up.
+    """
+    counts: Dict[str, int] = {}
+    for user in running_users:
+        counts[user] = counts.get(user, 0) + 1
+    finishing = deque(running_users)
+    pending = list(jobs)
+    order = []
+    while pending:
+        if finishing:
+            counts[finishing.popleft()] -= 1
+        job = fair_order(pending, counts)[0]
+        order.append(job)
+        pending.remove(job)
+        counts[job.user] = counts.get(job.user, 0) + 1
+        finishing.append(job.user)
+    return order
 
 
 def try_place(job: SchedJob, state: GpuState) -> Optional[List[int]]:
