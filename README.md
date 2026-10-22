@@ -220,8 +220,10 @@ ID      USER     STATUS    POS  PRIO  GPU  SUBMITTED         STARTED           N
 7a3f    alice    queued    1    -     -    2026-05-16 14:30  -                 baseline
 ```
 
-Running jobs come first, then the queue in order. `POS` is the position in the
-queue; `PRIO` shows a queued job's priority when it is not the default `0`.
+Running jobs come first, then the queue in the order jobs are expected to
+start (`POS`), fairness included — not in submission order. It is a forecast:
+it assumes running jobs end in the order they started. `PRIO` shows a queued
+job's priority when it is not the default `0`.
 
 ### `mine` — your jobs with summary
 

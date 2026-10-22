@@ -111,8 +111,9 @@ ID      USER     STATUS    POS  PRIO  GPU  SUBMITTED         STARTED           N
 7a3f    alice    queued    1    -     -    2026-05-16 14:30  -                 baseline
 ```
 
-Queued jobs are listed in queue order (`POS`). `PRIO` shows a queued job's
-priority when it isn't the default `0`.
+Queued jobs are listed in the order they are expected to start (`POS`), which
+follows the fairness rule rather than submission time. `PRIO` shows a queued
+job's priority when it isn't the default `0`.
 
 ### `logs` — view output
 

@@ -171,7 +171,8 @@ is root or runs as the daemon's own uid — those may act for any user.
 
 Fields explained:
 - `name` — the `--name` value if provided, otherwise null
-- `queue_position` — 1-based position in queue for `queued` jobs, null otherwise
+- `queue_position` — 1-based position in the expected start order for `queued`
+  jobs (fairness and priorities applied; a forecast), null otherwise
 - `started_at` / `finished_at` — null until the relevant event occurs
 - `exit_code` — null until finished; 0 = success, non-zero = failure
 
